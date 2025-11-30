@@ -344,9 +344,17 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Load data
+    DATASET_PATH = "/home/i.afanasyev/codeparrot-clean"
     print("[STATUS] preparing dataset...")
-    dataset = load_dataset("/home/i.afanasyev/codeparrot-clean", split="train", streaming=True)
-    print("[STATUS] data loaded.")
+
+    # Streaming dataset for training
+    dataset_stream = load_dataset(DATASET_PATH, split="train", streaming=True)
+    print("[STATUS] streaming dataset loaded.")
+
+    # Map-style dataset only for metadata (len, etc.)
+    dataset_map = load_dataset(DATASET_PATH, split="train")
+    total_rows = len(dataset_map)
+    print(f"[STATUS] map-style dataset loaded. total_rows = {total_rows:,}")
 
     # tokenize data
     tok = BPETokenizer(tokenizer_path=args.tok_path if os.path.exists(args.tok_path) else None)
