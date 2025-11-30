@@ -493,27 +493,6 @@ def analyze_memory_usage(model, batch_size=16, seq_length=512):
     print("-" * 60)
     print(f"TOTAL MODEL: {total_params:,} parameters")
     
-    # Memory calculations
-    param_memory_mb = total_params * 4 / (1024 ** 2)  # FP32
-    param_memory_mb_fp16 = total_params * 2 / (1024 ** 2)  # FP16
-    
-    # Activation memory estimation (rough)
-    activation_memory_mb = (batch_size * seq_length * model.config.n_embd * 10) / (1024 ** 2)  # Conservative estimate
-    
-    # Optimizer memory (AdamW: 2x for moments + 1x for params)
-    optimizer_memory_mb = param_memory_mb * 3
-    
-    total_training_memory_mb = param_memory_mb_fp16 + activation_memory_mb + optimizer_memory_mb
-    
-    print("\nMEMORY BREAKDOWN:")
-    print(f"Parameters (FP32): {param_memory_mb:.2f} MB")
-    print(f"Parameters (FP16): {param_memory_mb_fp16:.2f} MB")
-    print(f"Activations (est.): {activation_memory_mb:.2f} MB")
-    print(f"Optimizer (AdamW): {optimizer_memory_mb:.2f} MB")
-    print(f"TOTAL TRAINING: {total_training_memory_mb:.2f} MB")
-    print(f"RTX A5000 VRAM: 24,000 MB")
-    print(f"AVAILABLE HEADROOM: {24000 - total_training_memory_mb:.2f} MB")
-    
     return total_params, layer_breakdown
 
 
