@@ -18,34 +18,45 @@ from model import CONTEXT_SIZE, create_moegpt_deepseek_style, MoEGPTConfig, MoEG
 
 ########################################################################################################
 
-class StreamingDataset(Dataset):
-    def __init__(self, hf_dataset, tokenizer, seq_length=CONTEXT_SIZE, max_samples=1000):
+from torch.utils.data import IterableDataset  # add this import
+
+class StreamingDataset(IterableDataset):
+    """
+    Stream the Hugging Face dataset and yield fixed-length token chunks.
+
+    - Uses the *whole* streaming dataset (unless max_files_per_epoch is set).
+    - Tokenizes on the fly, so memory usage stays reasonable.
+    """
+    def __init__(
+        self,
+        hf_dataset,
+        tokenizer,
+        seq_length=CONTEXT_SIZE,
+        max_files_per_epoch: Optional[int] = None,
+    ):
         self.hf_dataset = hf_dataset
         self.tokenizer = tokenizer
         self.seq_length = seq_length
-        self.max_samples = max_samples
-        self._current_buffer = []
-        self._fill_buffer()
-    
-    def _fill_buffer(self):
-        """Fill buffer with tokenized samples"""
-        self._current_buffer = []
-        for i, row in enumerate(self.hf_dataset):
-            if i >= self.max_samples:
+        self.max_files_per_epoch = max_files_per_epoch
+
+    def __iter__(self):
+        """Each epoch, iterate over the HF streaming dataset and yield chunks."""
+        num_files = 0
+
+        for row in self.hf_dataset:
+            if self.max_files_per_epoch is not None and num_files >= self.max_files_per_epoch:
                 break
-            # Tokenize and split into sequences
+            num_files += 1
+
+            # Tokenize one file
             tokens = self.tokenizer.encode(row["content"])
-            # Split into chunks of seq_length
+
+            # Chunk into non-overlapping seq_length segments
+            # (same behavior as your old _fill_buffer)
             for i in range(0, len(tokens), self.seq_length):
                 chunk = tokens[i:i + self.seq_length]
-                if len(chunk) == self.seq_length:  # Only use complete sequences
-                    self._current_buffer.append(torch.tensor(chunk, dtype=torch.long))
-    
-    def __len__(self):
-        return len(self._current_buffer)
-    
-    def __getitem__(self, idx):
-        return self._current_buffer[idx]
+                if len(chunk) == self.seq_length:
+                    yield torch.tensor(chunk, dtype=torch.long)
 
 def get_batch_from_dataloader(dataloader):
     """Get batch from DataLoader instead of random sampling"""
@@ -117,8 +128,14 @@ def train(model, dataset, batch_size=16, epochs=3, lr=3e-4, grad_accum_steps=2,
           amp_dtype=torch.float16, use_autocast=True, use_scaler=True):
     """Training with checkpoint saving and resuming"""
     
-    stream_dataset = StreamingDataset(dataset, tok, seq_length=CONTEXT_SIZE)
-    dataloader = DataLoader(stream_dataset, batch_size=batch_size, shuffle=True)
+    stream_dataset = StreamingDataset(
+        dataset,
+        tok,
+        seq_length=CONTEXT_SIZE,
+        max_files_per_epoch=None,  # or an int like 100_000 if you want to cap
+    )
+    # IterableDataset does not support shuffle=True
+    dataloader = DataLoader(stream_dataset, batch_size=batch_size)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1)
     scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
