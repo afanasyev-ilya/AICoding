@@ -12,6 +12,11 @@ from typing import Optional, Tuple
 from dataclasses import dataclass, field
 from datasets import load_dataset
 from torch.utils.data import DataLoader, Dataset
+from contextlib import nullcontext  # NEW
+
+# NOTE: This file assumes MoEGPTConfig, MoEGPT, BPETokenizer are imported
+# from your main model/tokenizer module, e.g.:
+# from your_model_file import MoEGPTConfig, MoEGPT, BPETokenizer
 
 
 def save_checkpoint(model, optimizer, epoch, loss, checkpoint_dir="checkpoints"):
@@ -36,6 +41,7 @@ def save_checkpoint(model, optimizer, epoch, loss, checkpoint_dir="checkpoints")
     print(f"Checkpoint saved: {checkpoint_path}")
     return checkpoint_path
 
+
 def load_checkpoint(model, optimizer, checkpoint_path, device='cuda'):
     """Load model checkpoint"""
     if not os.path.exists(checkpoint_path):
@@ -53,6 +59,7 @@ def load_checkpoint(model, optimizer, checkpoint_path, device='cuda'):
     
     return checkpoint['epoch'], checkpoint['loss']
 
+
 def find_latest_checkpoint(checkpoint_dir="checkpoints"):
     """Find the latest checkpoint file"""
     if not os.path.exists(checkpoint_dir):
@@ -68,6 +75,7 @@ def find_latest_checkpoint(checkpoint_dir="checkpoints"):
     
     latest_checkpoint = max(checkpoint_files, key=extract_epoch)
     return latest_checkpoint
+
 
 def save_model(model, model_dir="saved_models"):
     """Save complete model for inference"""
@@ -86,6 +94,7 @@ def save_model(model, model_dir="saved_models"):
     
     print(f"Model saved: {model_path}")
     return model_path
+
 
 def load_model(model_class, model_path, device='cuda'):
     """Load complete model for inference or further training"""
@@ -106,6 +115,7 @@ def load_model(model_class, model_path, device='cuda'):
     print(f"Model loaded: {model_path}")
     return model
 
+
 def save_tokenizer(tokenizer, tokenizer_dir="saved_models"):
     """Save tokenizer"""
     Path(tokenizer_dir).mkdir(exist_ok=True)
@@ -113,6 +123,7 @@ def save_tokenizer(tokenizer, tokenizer_dir="saved_models"):
     tokenizer.tk.save(tokenizer_path)
     print(f"Tokenizer saved: {tokenizer_path}")
     return tokenizer_path
+
 
 def load_tokenizer(tokenizer_dir="saved_models"):
     """Load tokenizer"""
@@ -124,24 +135,64 @@ def load_tokenizer(tokenizer_dir="saved_models"):
     print(f"Tokenizer loaded: {tokenizer_path}")
     return tokenizer
 
-def inference_from_saved(model_path, tokenizer_path, prompt="", max_new_tokens=100, temperature=0.3):
-    """Load model and tokenizer for inference"""
+
+# --- NEW: precision helper for inference_from_saved ---
+
+def _get_precision_for_inference(precision: str):
+    """
+    Map a string precision name to (param_dtype, amp_dtype, use_autocast).
+    This is only used for pure inference_from_saved.
+    """
+    precision = precision.lower()
+    if precision == "fp16":
+        return torch.float16, torch.float16, True
+    elif precision == "bf16":
+        return torch.bfloat16, torch.bfloat16, True
+    elif precision == "fp32":
+        return torch.float32, torch.float32, False
+    else:
+        raise ValueError(f"Unsupported precision: {precision}")
+
+
+def inference_from_saved(
+    model_path,
+    tokenizer_path,
+    prompt="",
+    max_new_tokens=100,
+    temperature=0.3,
+    precision: str = "fp16",
+):
+    """
+    Load model and tokenizer for inference.
+
+    precision: "fp32", "fp16", or "bf16"
+      - "fp16": weights -> float16, autocast(float16)
+      - "bf16": weights -> bfloat16, autocast(bfloat16)
+      - "fp32": weights -> float32, no autocast
+    """
     # Load tokenizer
     tokenizer = BPETokenizer(tokenizer_path)
     
+    # Choose precision
+    param_dtype, amp_dtype, use_autocast = _get_precision_for_inference(precision)
+    
     # Load model
     model = load_model(MoEGPT, model_path)
-    model = model.half()
+    model = model.to(device='cuda', dtype=param_dtype)
     model.eval()
     
     # Run inference
+    ids = tokenizer.encode(prompt)
+    ctx = torch.tensor([ids], dtype=torch.long, device='cuda')
+
+    if use_autocast and amp_dtype != torch.float32:
+        autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype)
+    else:
+        autocast_ctx = nullcontext()
+
     with torch.no_grad():
-        ids = tokenizer.encode(prompt)
-        ctx = torch.tensor([ids], dtype=torch.long, device='cuda')
-        
-        with torch.cuda.amp.autocast(dtype=torch.float16):
+        with autocast_ctx:
             out = model.generate(ctx, max_new_tokens, temperature=temperature)[0].tolist()
-        
-        generated = tokenizer.decode(out)
     
+    generated = tokenizer.decode(out)
     return generated

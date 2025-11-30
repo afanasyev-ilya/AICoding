@@ -9,11 +9,13 @@ from typing import Optional, Tuple
 from dataclasses import dataclass, field
 from datasets import load_dataset
 from torch.utils.data import DataLoader, Dataset
+from contextlib import nullcontext
+
 from checkpoints import *
 
 ########################################################################################################
 
-CONTEXT_SIZE = 512
+CONTEXT_SIZE = 2048
 
 @dataclass
 class BaseGPTConfig:
@@ -306,7 +308,7 @@ class MoELayer(nn.Module):
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
         
         # Create expert masks - VECTORIZED
-        expert_mask = torch.zeros(B * T, self.config.num_experts, device=x.device)
+        expert_mask = torch.zeros(B * T, self.config.num_experts, device=x.device, dtype=router_probs.dtype)
         expert_mask.scatter_(1, topk_indices, topk_weights)
         
         # Initialize output
@@ -327,21 +329,22 @@ class MoELayer(nn.Module):
         output = output.reshape(B, T, C)
         
         # Aux loss
-        aux_loss = self._compute_aux_loss(router_probs, topk_indices) if self.training else 0.0
+        aux_loss = self._compute_aux_loss(router_probs, topk_indices) if self.training else x.new_zeros(())
         
         return output, aux_loss
 
     def _compute_aux_loss(self, router_probs, topk_indices):
-        # Expert usage statistics - VECTORIZED
-        expert_usage = torch.zeros(self.config.num_experts, device=router_probs.device)
+        # Compute in fp32 for stability, then cast back
+        router_probs_f32 = router_probs.float()
+        expert_usage = torch.zeros(self.config.num_experts, device=router_probs.device, dtype=torch.float32)
         for expert_idx in range(self.config.num_experts):
             expert_usage[expert_idx] = (topk_indices == expert_idx).float().mean()
         
         target_usage = torch.ones_like(expert_usage) / self.config.num_experts
         aux_loss = F.mse_loss(expert_usage, target_usage)
-        return aux_loss
+        return aux_loss.to(router_probs.dtype)
 
-# NEW: DeepSeek-style alternating MHA -> MoE blocks
+# DeepSeek-style alternating MHA -> MoE blocks
 class MHAThenMoEBlock(nn.Module):
     """DeepSeek-style block: MHA followed by MoE (replaces dense FFN)"""
     def __init__(self, config: MoEGPTConfig):
@@ -370,7 +373,7 @@ class MoEGPT(nn.Module):
             self.pos_emb = nn.Embedding(config.block_size, config.n_embd)
         self.drop = nn.Dropout(config.dropout)
 
-        # NEW: Use alternating MHA -> MoE blocks (DeepSeek style)
+        # DeepSeek-style: alternating MHA -> MoE blocks
         self.blocks = nn.ModuleList([
             MHAThenMoEBlock(config) for _ in range(config.n_layer)
         ])
@@ -387,9 +390,8 @@ class MoEGPT(nn.Module):
             x = x + self.pos_emb(pos)
 
         x = self.drop(x)
-        aux_total = 0.0
+        aux_total = x.new_zeros(())
         
-        # NEW: Process all MHA->MoE blocks
         for block in self.blocks:
             x, aux_loss = block(x)
             aux_total = aux_total + aux_loss
@@ -399,21 +401,24 @@ class MoEGPT(nn.Module):
         
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            # Compute CE in fp32 for stability
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)).float(),
+                targets.view(-1)
+            )
         
         return logits, loss, aux_total
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens: int, temperature=0.8):
-        # Use autocast in generation loop
-        with torch.cuda.amp.autocast(dtype=torch.float16):
-            for _ in range(max_new_tokens):
-                idx_cond = idx[:, -self.config.block_size:]
-                logits, _, _ = self.forward(idx_cond)
-                logits = logits[:, -1, :] / temperature
-                probs = F.softmax(logits, dim=-1)
-                next_id = torch.multinomial(probs, num_samples=1)
-                idx = torch.cat([idx, next_id], dim=1)
+        # No internal autocast; caller controls precision context
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -self.config.block_size:]
+            logits, _, _ = self.forward(idx_cond)
+            logits = logits[:, -1, :] / temperature
+            probs = F.softmax(logits, dim=-1)
+            next_id = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat([idx, next_id], dim=1)
         return idx
 
 ########################################################################################################
@@ -496,15 +501,32 @@ def analyze_memory_usage(model, batch_size=16, seq_length=512):
     return total_params, layer_breakdown
 
 
+def get_precision_config(precision: str):
+    """
+    Returns (param_dtype, amp_dtype, use_autocast, use_scaler) for training/inference.
+    - param_dtype: dtype of model weights
+    - amp_dtype:   dtype used by autocast for activations
+    """
+    if precision == "fp32":
+        return torch.float32, torch.float32, False, False
+    elif precision == "fp16":
+        return torch.float16, torch.float16, True, True
+    elif precision == "bf16":
+        return torch.bfloat16, torch.bfloat16, True, False
+    else:
+        raise ValueError(f"Unsupported precision: {precision}")
+
+
 def train(model, dataset, batch_size=16, epochs=3, lr=3e-4, grad_accum_steps=2, 
-          checkpoint_dir="checkpoints", save_every=10, resume_from=None):
+          checkpoint_dir="checkpoints", save_every=10, resume_from=None,
+          amp_dtype=torch.float16, use_autocast=True, use_scaler=True):
     """Training with checkpoint saving and resuming"""
     
     stream_dataset = StreamingDataset(dataset, tok, seq_length=CONTEXT_SIZE)
     dataloader = DataLoader(stream_dataset, batch_size=batch_size, shuffle=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1)
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
     
     start_epoch = 1
     best_loss = float('inf')
@@ -525,25 +547,39 @@ def train(model, dataset, batch_size=16, epochs=3, lr=3e-4, grad_accum_steps=2,
     model.train()
     
     for epoch in range(start_epoch, epochs + 1):
-        total_loss = 0
+        total_loss = 0.0
         num_batches = 0
         
         for step, batch in enumerate(dataloader):
             xb = batch[:, :-1].to('cuda', non_blocking=True)
             yb = batch[:, 1:].to('cuda', non_blocking=True)
 
-            with torch.cuda.amp.autocast():
+            if use_autocast and amp_dtype != torch.float32:
+                autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype)
+            else:
+                autocast_ctx = nullcontext()
+
+            with autocast_ctx:
                 logits, loss_ce, aux_loss = model(xb, yb)
                 loss = loss_ce + model.config.aux_loss_weight * aux_loss
                 loss = loss / grad_accum_steps
 
-            scaler.scale(loss).backward()
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
             if (step + 1) % grad_accum_steps == 0:
-                scaler.unscale_(optimizer)
+                if scaler.is_enabled():
+                    scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
+
+                if scaler.is_enabled():
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+
                 optimizer.zero_grad(set_to_none=True)
 
             total_loss += loss.item() * grad_accum_steps
@@ -553,7 +589,7 @@ def train(model, dataset, batch_size=16, epochs=3, lr=3e-4, grad_accum_steps=2,
                 avg_loss = total_loss / (step + 1)
                 print(f"epoch {epoch:3d}/{epochs} | step {step:4d} | loss {avg_loss:.4f}")
 
-        avg_epoch_loss = total_loss / num_batches
+        avg_epoch_loss = total_loss / max(1, num_batches)
         print(f"epoch {epoch:3d}/{epochs} | avg_loss {avg_epoch_loss:.4f}")
         
         # Save checkpoint
@@ -578,38 +614,58 @@ def train(model, dataset, batch_size=16, epochs=3, lr=3e-4, grad_accum_steps=2,
         # Generate sample to monitor progress
         if epoch % 20 == 0:
             model.eval()
-            sample = inference(model, tok, "def binary_search(arr, target):\n", max_new_tokens=100)
+            sample = inference(
+                model,
+                tok,
+                "def binary_search(arr, target):\n",
+                max_new_tokens=100,
+                temperature=0.8,
+                amp_dtype=amp_dtype,
+                use_autocast=use_autocast,
+            )
             print(f"\n--- Epoch {epoch} Sample ---")
             print(sample[:500] + "..." if len(sample) > 500 else sample)
             print("---" + "-" * 20)
             model.train()
 
 
-def inference(model, tok, prompt = "", max_new_tokens=100):
-    model = model.half()
+def inference(model, tok, prompt="", max_new_tokens=100, temperature=0.8,
+              amp_dtype=torch.float32, use_autocast=False):
     model.eval()
-
-    # prepare empty context for now
-    ctx = torch.zeros((1, 1), dtype=torch.long).to('cuda')
 
     ids = tok.encode(prompt)
     ctx = torch.tensor([ids], dtype=torch.long, device='cuda')
 
-    # infer
-    out = model.generate(ctx, max_new_tokens)[0].tolist()
-    generated = tok.decode(out)
+    if use_autocast and amp_dtype != torch.float32:
+        autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype)
+    else:
+        autocast_ctx = nullcontext()
 
+    with torch.no_grad():
+        with autocast_ctx:
+            out = model.generate(ctx, max_new_tokens, temperature=temperature)[0].tolist()
+
+    generated = tok.decode(out)
     return generated
 
 
-def generate_multiple_samples(model, tok, prompt, num_samples=3, max_new_tokens=150, temperature=0.7):
+def generate_multiple_samples(model, tok, prompt, num_samples=3, max_new_tokens=150, temperature=0.7,
+                              amp_dtype=torch.float32, use_autocast=False):
     """Generate multiple samples and pick the best one"""
     samples = []
     
     for i in range(num_samples):
         # Vary temperature slightly for diversity
         current_temp = temperature * (0.8 + 0.4 * (i / num_samples))
-        sample = inference(model, tok, prompt, max_new_tokens, temperature=current_temp)
+        sample = inference(
+            model,
+            tok,
+            prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=current_temp,
+            amp_dtype=amp_dtype,
+            use_autocast=use_autocast,
+        )
         samples.append(sample)
         
         print(f"--- Sample {i+1} (temp={current_temp:.2f}) ---")
@@ -644,12 +700,21 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     # LLM settings
-    parser.add_argument("--epochs", type=int, default=2000)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--max_new_tokens", type=int, default=1000)
     parser.add_argument("--pos_encoding", type=str, choices=["rope", "learned"], default="rope")
     parser.add_argument("--model_arch", type=str, choices=["deepseek", "optimized"], default="deepseek")
+
+    # Precision settings
+    parser.add_argument(
+        "--precision",
+        type=str,
+        choices=["fp32", "fp16", "bf16"],
+        default="fp32",
+        help="Compute precision for weights + activations: fp32, fp16, or bf16",
+    )
     
     # Checkpoint settings
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
@@ -684,7 +749,7 @@ if __name__ == "__main__":
 
     # Load or create model
     if args.resume_from and args.resume_from != "latest" and os.path.exists(args.resume_from):
-        # Load existing model from checkpoint
+        # Load existing model from checkpoint (dtype will be converted below)
         model = load_model(MoEGPT, args.resume_from)
         print(f"[STATUS] Model loaded from checkpoint: {args.resume_from}")
     else:
@@ -696,8 +761,14 @@ if __name__ == "__main__":
             cfg = create_moegpt_a5000_optimized(vocab_size=tok.vocab_size)
             print("[ARCHITECTURE] Using optimized single-MoE architecture")
         
-        model = MoEGPT(cfg).cuda()
-        print("[STATUS] New model created and moved to CUDA.")
+        model = MoEGPT(cfg)
+        print("[STATUS] New model created.")
+
+    # Precision configuration (weights + activations)
+    param_dtype, amp_dtype, use_autocast, use_scaler = get_precision_config(args.precision)
+    model = model.to(device="cuda", dtype=param_dtype)
+    print(f"[PRECISION] Using {args.precision}: weights={param_dtype}, activations={amp_dtype}, "
+          f"autocast={use_autocast}, scaler={use_scaler}")
 
     # Print model info
     total_params, breakdown = analyze_memory_usage(model, batch_size=args.batch_size, seq_length=CONTEXT_SIZE)
@@ -716,7 +787,10 @@ if __name__ == "__main__":
           lr=args.lr,
           checkpoint_dir=args.checkpoint_dir,
           save_every=args.save_every,
-          resume_from=args.resume_from)
+          resume_from=args.resume_from,
+          amp_dtype=amp_dtype,
+          use_autocast=use_autocast,
+          use_scaler=use_scaler)
 
     # Save final model
     if args.save_final_model:
@@ -739,16 +813,28 @@ if __name__ == "__main__":
     
     for prompt in prompts:
         print(f"\n--- Generating for: {prompt.strip()} ---")
-        output = inference(model, tok, prompt, max_new_tokens=args.max_new_tokens)
+        output = inference(
+            model,
+            tok,
+            prompt,
+            max_new_tokens=args.max_new_tokens,
+            temperature=0.8,
+            amp_dtype=amp_dtype,
+            use_autocast=use_autocast,
+        )
         print(output)
         print("-" * 40)
 
     # Also try multiple samples for the main prompt
     print("\n--- Multiple samples for binary_search ---")
     best_code, all_samples = generate_multiple_samples(
-        model, tok, 
+        model,
+        tok, 
         "def binary_search(arr, target):\n",
-        num_samples=3
+        num_samples=3,
+        max_new_tokens=args.max_new_tokens,
+        amp_dtype=amp_dtype,
+        use_autocast=use_autocast,
     )
     
     print("\n--- BEST SAMPLE ---")

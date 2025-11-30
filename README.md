@@ -16,3 +16,16 @@ Run sample inference:
 ```
 python3 ./phi.py
 ```
+
+
+### Training custom model
+
+Intitial training start:
+```
+python3 ./train_coding.py --precision bf16 --epoch 100 --pos_encoding rope --batch_size 8
+```
+
+Resume training:
+```
+python3 ./train_coding.py --precision bf16 --pos_encoding rope --batch_size 8 --resume_from latest --epochs 15
+```
