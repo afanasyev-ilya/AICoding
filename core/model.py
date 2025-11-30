@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datasets import load_dataset
 from torch.utils.data import DataLoader, Dataset
 from contextlib import nullcontext
+from torch.utils.checkpoint import checkpoint  # <-- NEW
 
 ########################################################################################################
 
@@ -45,7 +46,7 @@ def create_moegpt_deepseek_style(vocab_size: int, **kwargs) -> MoEGPTConfig:
     return MoEGPTConfig(
         vocab_size=vocab_size,
         # For DeepSeek style, n_layer means number of (MHA + MoE) blocks
-        n_layer=6,           # Total blocks: 12 MHA + 12 MoE layers
+        n_layer=6,           # Total blocks: 20 MHA + 20 MoE layers
         n_head=16,           
         n_embd=1024,         
         block_size=CONTEXT_SIZE,
@@ -301,11 +302,23 @@ class MoEGPT(nn.Module):
 
         x = self.drop(x)
         aux_total = x.new_zeros(())
-        
-        for block in self.blocks:
-            x, aux_loss = block(x)
-            aux_total = aux_total + aux_loss
-        
+
+        # --- Activation checkpointing over blocks ---
+        if self.training:
+            for block in self.blocks:
+                # Need default arg block=block to avoid late binding in closure
+                def custom_forward(x_in, block=block):
+                    return block(x_in)  # returns (x_out, aux_loss)
+
+                x, aux_loss = checkpoint(custom_forward, x)
+                aux_total = aux_total + aux_loss
+        else:
+            # No checkpointing during eval/inference
+            for block in self.blocks:
+                x, aux_loss = block(x)
+                aux_total = aux_total + aux_loss
+        # --------------------------------------------
+
         x = self.ln_f(x)
         logits = self.head(x)
         
@@ -330,5 +343,3 @@ class MoEGPT(nn.Module):
             next_id = torch.multinomial(probs, num_samples=1)
             idx = torch.cat([idx, next_id], dim=1)
         return idx
-
-
