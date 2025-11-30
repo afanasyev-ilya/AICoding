@@ -12,12 +12,9 @@ from typing import Optional, Tuple
 from dataclasses import dataclass, field
 from datasets import load_dataset
 from torch.utils.data import DataLoader, Dataset
-from contextlib import nullcontext  # NEW
-
-# NOTE: This file assumes MoEGPTConfig, MoEGPT, BPETokenizer are imported
-# from your main model/tokenizer module, e.g.:
-# from your_model_file import MoEGPTConfig, MoEGPT, BPETokenizer
-
+from contextlib import nullcontext
+from tokenizer import BPETokenizer
+from model import MoEGPTConfig, MoEGPT
 
 def save_checkpoint(model, optimizer, epoch, loss, checkpoint_dir="checkpoints"):
     """Save model checkpoint"""
