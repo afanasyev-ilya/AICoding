@@ -1,0 +1,3 @@
+core/checkpoints/*
+core/__pycache__/*
+core/saved_models/*
