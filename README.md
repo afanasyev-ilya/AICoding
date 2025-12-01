@@ -25,6 +25,16 @@ Intitial training start:
 python3 ./train.py --precision bf16 --epochs 100 --pos_encoding rope --batch_size 8
 ```
 
+Optimizations, used for reduced memory consumption:
+1. Flash-attention
+2. Using BF16 training
+3. Activation checkpointing (prevents storing activation tensors inside block, but increases compute complexity)
+
+As a result, around 1.5B model fits into single A5000 GPU for training (each parameter results into more than 1 BF16 value for training, + some activations are stored).
+
+Model architecutre is multiple blocks, each block is attention + MoE, with top-K routing.
+
+
 Resume training:
 ```
 python3 ./train.py --precision bf16 --pos_encoding rope --batch_size 8 --resume_from latest --epochs 15
