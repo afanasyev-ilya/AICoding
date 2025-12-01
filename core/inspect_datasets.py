@@ -3,6 +3,7 @@ import argparse
 from pprint import pprint
 
 from datasets import load_dataset
+import json
 
 
 def load_apps(split: str):
@@ -34,12 +35,41 @@ def load_mbpp(subset: str):
     return ds
 
 
+def pretty_print_sample(sample):
+    print("{")
+    for key, value in sample.items():
+        print(f"  {key}:")
+        if key == "solutions" and isinstance(value, str):
+            # Parse JSON-encoded list of solutions
+            try:
+                sols = json.loads(value)
+            except json.JSONDecodeError:
+                print("    [!! could not decode solutions JSON !!]")
+                print(value)
+                continue
+
+            for idx, sol in enumerate(sols):
+                print(f"    --- solution #{idx} ---")
+                print(sol)   # real newlines and tabs
+                print()
+        else:
+            if isinstance(value, str):
+                # Normal strings – show as text
+                for line in value.splitlines():
+                    print(f"    {line}")
+            else:
+                # Non-strings – use pprint
+                pretty = pprint(value, width=80, compact=False)
+        print()
+    print("}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["apps", "mbpp_full", "mbpp_sanitized"],
+        choices=["apps"],
         default="apps",
         help="Which dataset to inspect",
     )
@@ -60,12 +90,9 @@ def main():
     if args.dataset == "apps":
         print(f"Loading dataset: codeparrot/apps (split={args.split}) via raw JSONL...")
         ds = load_apps(args.split)
-    elif args.dataset == "mbpp_full":
-        print("Loading dataset: Muennighoff/mbpp (subset=full, split=test)...")
-        ds = load_mbpp("full")
-    else:  # mbpp_sanitized
-        print("Loading dataset: Muennighoff/mbpp (subset=sanitized, split=test)...")
-        ds = load_mbpp("sanitized")
+    else:
+        print("Unsupported dataset")
+        exit(1)
 
     print(f"Loaded {len(ds)} rows.\n")
 
@@ -74,7 +101,8 @@ def main():
         print("=" * 80)
         print(f"SAMPLE {i}")
         print("-" * 80)
-        pprint(ds[i])
+        sample = ds[i]
+        pretty_print_sample(sample)
         print()
 
 
