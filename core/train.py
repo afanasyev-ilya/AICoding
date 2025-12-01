@@ -20,12 +20,14 @@ from model import CONTEXT_SIZE, create_moegpt_deepseek_style, MoEGPTConfig, MoEG
 
 from torch.utils.data import IterableDataset  # add this import
 
+
 class StreamingDataset(IterableDataset):
     """
     Stream the Hugging Face dataset and yield fixed-length token chunks.
 
     - Uses the *whole* streaming dataset (unless max_files_per_epoch is set).
     - Tokenizes on the fly, so memory usage stays reasonable.
+    - Tracks how many source rows/files were processed in this epoch.
     """
     def __init__(
         self,
@@ -39,24 +41,29 @@ class StreamingDataset(IterableDataset):
         self.seq_length = seq_length
         self.max_files_per_epoch = max_files_per_epoch
 
+        # Stats per epoch
+        self.files_yielded = 0
+
     def __iter__(self):
         """Each epoch, iterate over the HF streaming dataset and yield chunks."""
+        self.files_yielded = 0
         num_files = 0
 
         for row in self.hf_dataset:
             if self.max_files_per_epoch is not None and num_files >= self.max_files_per_epoch:
                 break
             num_files += 1
+            self.files_yielded += 1
 
             # Tokenize one file
             tokens = self.tokenizer.encode(row["content"])
 
             # Chunk into non-overlapping seq_length segments
-            # (same behavior as your old _fill_buffer)
             for i in range(0, len(tokens), self.seq_length):
                 chunk = tokens[i:i + self.seq_length]
                 if len(chunk) == self.seq_length:
                     yield torch.tensor(chunk, dtype=torch.long)
+
 
 def get_batch_from_dataloader(dataloader):
     """Get batch from DataLoader instead of random sampling"""
@@ -123,10 +130,29 @@ def get_precision_config(precision: str):
         raise ValueError(f"Unsupported precision: {precision}")
 
 
-def train(model, dataset, batch_size=16, epochs=3, lr=3e-4, grad_accum_steps=2, 
-          checkpoint_dir="checkpoints", save_every=10, resume_from=None,
-          amp_dtype=torch.float16, use_autocast=True, use_scaler=True):
-    """Training with checkpoint saving and resuming"""
+def train(
+    model,
+    dataset,
+    batch_size=16,
+    epochs=3,
+    lr=3e-4,
+    grad_accum_steps=2,
+    checkpoint_dir="checkpoints",
+    save_every=10,  # kept for compatibility, but not used for epoch-based saving now
+    resume_from=None,
+    amp_dtype=torch.float16,
+    use_autocast=True,
+    use_scaler=True,
+    total_rows: Optional[int] = None,
+    save_every_minutes: Optional[float] = None,
+):
+    """Training with checkpoint saving and resuming.
+
+    - Shows row-level progress: processed X / Y rows (Z%).
+    - Saves a checkpoint every `save_every_minutes` minutes (time-based).
+    - Removes previous checkpoint file when a new one is saved.
+    - Keeps and updates a best-model checkpoint based on running avg loss.
+    """
     
     stream_dataset = StreamingDataset(
         dataset,
@@ -134,8 +160,9 @@ def train(model, dataset, batch_size=16, epochs=3, lr=3e-4, grad_accum_steps=2,
         seq_length=CONTEXT_SIZE,
         max_files_per_epoch=None,  # or an int like 100_000 if you want to cap
     )
-    # IterableDataset does not support shuffle=True
-    dataloader = DataLoader(stream_dataset, batch_size=batch_size)
+    # IterableDataset does not support shuffle=True; we also require num_workers=0
+    # so that stats (files_yielded) are visible in this process.
+    dataloader = DataLoader(stream_dataset, batch_size=batch_size, num_workers=0)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1)
     scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
@@ -157,12 +184,43 @@ def train(model, dataset, batch_size=16, epochs=3, lr=3e-4, grad_accum_steps=2,
     
     print(f"[STATUS] Training started from epoch {start_epoch}...")
     model.train()
-    
+
+    # Global stats
+    global_step = 0
+
+    # Time-based checkpointing
+    last_ckpt_time = time.time()
+    last_ckpt_path: Optional[str] = None
+
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    best_path = os.path.join(checkpoint_dir, "checkpoint_best.pt")
+
+    def save_time_based_checkpoint(current_epoch: int, current_loss: float):
+        nonlocal last_ckpt_path, last_ckpt_time
+        # Use your existing helper; it returns the epoch-specific path.
+        ckpt_path = save_checkpoint(model, optimizer, current_epoch, current_loss, checkpoint_dir)
+
+        # Remove previous epoch checkpoint if different
+        if last_ckpt_path is not None and last_ckpt_path != ckpt_path and os.path.exists(last_ckpt_path):
+            try:
+                os.remove(last_ckpt_path)
+                print(f"[CHECKPOINT] Removed previous checkpoint: {last_ckpt_path}")
+            except OSError as e:
+                print(f"[CHECKPOINT] Failed to remove previous checkpoint {last_ckpt_path}: {e}")
+
+        last_ckpt_path = ckpt_path
+        last_ckpt_time = time.time()
+        print(f"[CHECKPOINT] Saved checkpoint: {ckpt_path}")
+
     for epoch in range(start_epoch, epochs + 1):
         total_loss = 0.0
         num_batches = 0
-        
+
+        print(f"[STATUS] Starting epoch {epoch}/{epochs}")
+
         for step, batch in enumerate(dataloader):
+            global_step += 1
+
             xb = batch[:, :-1].to('cuda', non_blocking=True)
             yb = batch[:, 1:].to('cuda', non_blocking=True)
 
@@ -197,50 +255,77 @@ def train(model, dataset, batch_size=16, epochs=3, lr=3e-4, grad_accum_steps=2,
             total_loss += loss.item() * grad_accum_steps
             num_batches += 1
 
-            if step % 100 == 0:
-                avg_loss = total_loss / (step + 1)
-                print(f"epoch {epoch:3d}/{epochs} | step {step:4d} | loss {avg_loss:.4f}")
+            # Time-based checkpointing
+            if save_every_minutes is not None and save_every_minutes > 0:
+                elapsed_minutes = (time.time() - last_ckpt_time) / 60.0
+                if elapsed_minutes >= save_every_minutes:
+                    avg_loss_so_far = total_loss / max(1, num_batches)
+                    print(f"[CHECKPOINT] {elapsed_minutes:.2f} minutes elapsed since last checkpoint. "
+                          f"Saving at epoch {epoch}, step {step}, global_step {global_step}.")
+                    save_time_based_checkpoint(epoch, avg_loss_so_far)
 
+            # Periodic logging + best model updates
+            if step % 100 == 0:
+                avg_loss = total_loss / max(1, num_batches)
+
+                # Row progress: processed X / total_rows rows
+                if total_rows is not None and total_rows > 0:
+                    rows_seen = getattr(stream_dataset, "files_yielded", 0)
+                    row_pct = rows_seen / total_rows * 100.0
+                    row_info = f" | processed {rows_seen:,}/{total_rows:,} rows ({row_pct:5.2f}%)"
+                else:
+                    row_info = ""
+
+                print(
+                    f"epoch {epoch:3d}/{epochs} | "
+                    f"step {step:5d} | "
+                    f"loss {avg_loss:.4f}{row_info}"
+                )
+
+                # Best-model checkpoint based on running avg loss
+                if avg_loss < best_loss:
+                    best_loss = avg_loss
+                    torch.save(
+                        {
+                            "epoch": epoch,
+                            "step": step,
+                            "global_step": global_step,
+                            "model_state_dict": model.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "loss": best_loss,
+                            "config": model.config.__dict__,
+                        },
+                        best_path,
+                    )
+                    print(f"[BEST] New best model saved with running avg loss: {best_loss:.4f} "
+                          f"at epoch {epoch}, step {step}, global_step {global_step}")
+
+        # End of epoch summary
         avg_epoch_loss = total_loss / max(1, num_batches)
         print(f"epoch {epoch:3d}/{epochs} | avg_loss {avg_epoch_loss:.4f}")
-        
-        # Save checkpoint
-        if epoch % save_every == 0 or epoch == epochs:
-            print("saving....")
-            print(f"{epoch} - {save_every}")
-            save_checkpoint(model, optimizer, epoch, avg_epoch_loss, checkpoint_dir)
-            
-        # Save best model
+
+        # Optionally, also update best at epoch boundary (keeps old behavior)
         if avg_epoch_loss < best_loss:
             best_loss = avg_epoch_loss
-            # save_checkpoint(model, optimizer, epoch, avg_epoch_loss, checkpoint_dir)
-            # Also save as best model
-            best_path = f"{checkpoint_dir}/checkpoint_best.pt"
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': avg_epoch_loss,
-                'config': model.config.__dict__,
-            }, best_path)
-            print(f"New best model saved with loss: {best_loss:.4f}")
-        
-        # Generate sample to monitor progress
-        if epoch % 20 == 0:
-            model.eval()
-            sample = inference(
-                model,
-                tok,
-                "def binary_search(arr, target):\n",
-                max_new_tokens=100,
-                temperature=0.8,
-                amp_dtype=amp_dtype,
-                use_autocast=use_autocast,
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "step": -1,
+                    "global_step": global_step,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "loss": best_loss,
+                    "config": model.config.__dict__,
+                },
+                best_path,
             )
-            print(f"\n--- Epoch {epoch} Sample ---")
-            print(sample[:500] + "..." if len(sample) > 500 else sample)
-            print("---" + "-" * 20)
-            model.train()
+            print(f"[BEST] New best model (epoch avg) saved with loss: {best_loss:.4f}")
+
+        # Final safety: at the very end of training, we can ensure a checkpoint exists
+        if epoch == epochs:
+            avg_loss_for_save = avg_epoch_loss
+            print("[CHECKPOINT] Final epoch reached, saving final checkpoint.")
+            save_time_based_checkpoint(epoch, avg_loss_for_save)
 
 
 def inference(model, tok, prompt="", max_new_tokens=100, temperature=0.8,
@@ -332,7 +417,14 @@ if __name__ == "__main__":
     
     # Checkpoint settings
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
-    parser.add_argument("--save_every", type=int, default=50, help="Save checkpoint every N epochs")
+    parser.add_argument("--save_every", type=int, default=50,
+                        help="(Unused for epochs now, kept for compatibility)")
+    parser.add_argument(
+        "--save_every_minutes",
+        type=float,
+        default=30.0,
+        help="Save checkpoint every N minutes (time-based). Set <=0 to disable.",
+    )
     parser.add_argument("--resume_from", type=str, default=None, 
                        help="Resume from 'latest', or path to specific checkpoint")
     parser.add_argument("--save_final_model", action="store_true", default=True, 
@@ -361,7 +453,7 @@ if __name__ == "__main__":
     if tok.tk is None:
         print(f"[STATUS] Training byte-level BPE tokenizer (vocab={args.vocab_size}) on dataset...")
         tok.train(
-            dataset=dataset,
+            dataset=dataset_stream,
             vocab_size=args.vocab_size, 
             save_path=args.tok_path,
             max_samples=1000
@@ -403,16 +495,21 @@ if __name__ == "__main__":
     print(f"• Context: {model.config.block_size} tokens")
 
     # Train the model
-    train(model, dataset, 
-          batch_size=args.batch_size, 
-          epochs=args.epochs, 
-          lr=args.lr,
-          checkpoint_dir=args.checkpoint_dir,
-          save_every=args.save_every,
-          resume_from=args.resume_from,
-          amp_dtype=amp_dtype,
-          use_autocast=use_autocast,
-          use_scaler=use_scaler)
+    train(
+        model,
+        dataset_stream, 
+        batch_size=args.batch_size, 
+        epochs=args.epochs, 
+        lr=args.lr,
+        checkpoint_dir=args.checkpoint_dir,
+        save_every=args.save_every,
+        resume_from=args.resume_from,
+        amp_dtype=amp_dtype,
+        use_autocast=use_autocast,
+        use_scaler=use_scaler,
+        total_rows=total_rows,
+        save_every_minutes=args.save_every_minutes,
+    )
 
     # Save final model
     if args.save_final_model:
