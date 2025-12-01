@@ -2,6 +2,7 @@
 
 import argparse
 from checkpoints import inference_from_saved
+from tests.prompts import MATMUL_PROMPT
 
 DEFAULT_PROMPT = "def binary_search(arr, target):\n"
 
