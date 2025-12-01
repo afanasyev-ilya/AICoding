@@ -158,6 +158,7 @@ def inference_from_saved(
     max_new_tokens=100,
     temperature=0.3,
     precision: str = "fp16",
+    measure_speed: bool = True,
 ):
     """
     Load model and tokenizer for inference.
@@ -169,27 +170,96 @@ def inference_from_saved(
     """
     # Load tokenizer
     tokenizer = BPETokenizer(tokenizer_path)
-    
+
     # Choose precision
     param_dtype, amp_dtype, use_autocast = _get_precision_for_inference(precision)
-    
+
     # Load model
     model = load_model(MoEGPT, model_path)
-    model = model.to(device='cuda', dtype=param_dtype)
+    model = model.to(device="cuda", dtype=param_dtype)
     model.eval()
-    
+
     # Run inference
     ids = tokenizer.encode(prompt)
-    ctx = torch.tensor([ids], dtype=torch.long, device='cuda')
+    ctx = torch.tensor([ids], dtype=torch.long, device="cuda")
 
     if use_autocast and amp_dtype != torch.float32:
         autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype)
     else:
         autocast_ctx = nullcontext()
 
+    start = time.perf_counter()
     with torch.no_grad():
         with autocast_ctx:
-            out = model.generate(ctx, max_new_tokens, temperature=temperature)[0].tolist()
-    
+            out = model.generate(
+                ctx,
+                max_new_tokens,
+                temperature=temperature,
+            )[0].tolist()
+    elapsed = time.perf_counter() - start
+
+    if measure_speed:
+        total_tokens = len(out)
+        prompt_tokens = len(ids)
+        new_tokens = max(total_tokens - prompt_tokens, 0)
+        toks_per_sec = 0.0 if elapsed <= 0.0 else new_tokens / elapsed
+        print(
+            f"[speed] generated {new_tokens} tokens in {elapsed:.3f}s "
+            f"({toks_per_sec:.2f} tok/s) "
+            f"(prompt={prompt_tokens}, total={total_tokens})"
+        )
+
     generated = tokenizer.decode(out)
     return generated
+
+
+def export_onnx_from_saved(
+    model_path: str,
+    tokenizer_path: str,
+    onnx_path: str,
+    seq_len: int = 128,
+    precision: str = "fp16",
+):
+    """
+    Load MoEGPT from a saved checkpoint and export to ONNX.
+
+    ONNX input:  input_ids: [batch, seq_len] (int64)
+    ONNX output: logits:    [batch, seq_len, vocab_size]
+    """
+    tokenizer = BPETokenizer(tokenizer_path)
+
+    # Get dtype & load model
+    param_dtype, _, _ = _get_precision_for_inference(precision)
+    model = load_model(MoEGPT, model_path)
+    model = model.to(device="cuda", dtype=param_dtype)
+    model.eval()
+
+    # Figure out vocab size from your tokenizer
+    try:
+        vocab_size = tokenizer.vocab_size
+    except AttributeError:
+        # adjust to your implementation; e.g. len(tokenizer.encoder)
+        vocab_size = len(tokenizer.encoder)
+
+    dummy_input = torch.randint(
+        low=0,
+        high=vocab_size,
+        size=(1, seq_len),
+        dtype=torch.long,
+        device="cuda",
+    )
+
+    print(f"[export] exporting ONNX to {onnx_path} with seq_len={seq_len}")
+    torch.onnx.export(
+        model,
+        dummy_input,          # forward(input_ids)
+        onnx_path,
+        input_names=["input_ids"],
+        output_names=["logits"],
+        dynamic_axes={
+            "input_ids": {1: "seq_len"},
+            "logits": {1: "seq_len"},
+        },
+        opset_version=17,
+    )
+    print(f"[export] ONNX saved to {onnx_path}")
