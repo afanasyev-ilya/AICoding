@@ -48,7 +48,7 @@ def main():
 
     args = parser.parse_args()
 
-    prompt = BINARY_SEARCH_PROMPT
+    prompt = "You need to implement binary search in python"
     print(f"=== Prompt ===\n{prompt}\n")
 
     output = inference_from_saved(

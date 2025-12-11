@@ -3,28 +3,34 @@ import gc
 import sys
 import time
 import threading
-
 import os
+
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+# Recommended in the GigaChat docs for tooling that may run custom code
+os.environ.setdefault("HF_ALLOW_CODE_EVAL", "1")
 
 import torch
 import sglang as sgl
 from huggingface_hub import snapshot_download
 from huggingface_hub.utils import enable_progress_bars
 from transformers import AutoTokenizer
+from transformers import AutoModelForCausalLM
 
-try:
-    from transformers import AutoModelForCausalLM
-except ImportError:
-    AutoModelForCausalLM = None
-    print("[WARN] transformers not installed -> model param count will be skipped.")
-    print("       Install with: pip install transformers")
+# --- GIGACHAT 3 LIGHTNING (BF16) ---
+# This is the ~10B MoE dialog model, "GigaChat 3 Lightning"
+# Model card: ai-sage/GigaChat3-10B-A1.8B-bf16
+MODEL_ID = "ai-sage/GigaChat3-10B-A1.8B-bf16"
 
-MODEL_ID = "unsloth/Qwen3-0.6B"
-# Force dtype so our size estimate is meaningful
-DTYPE_STR = "float16"   # you can change to "bfloat16" or "float32" if you want
+# We'll assume BF16 weights for size estimate & SGLang
+DTYPE_STR = "bfloat16"
 
 GB = 1024 ** 3
+
+# Known param counts for big models to avoid loading full weights on CPU
+KNOWN_NUM_PARAMS = {
+    "ai-sage/GigaChat3-10B-A1.8B-bf16": 11_000_000_000,  # from HF card
+    "ai-sage/GigaChat3-10B-A1.8B": 11_000_000_000,
+}
 
 
 # ---------- Helpers ----------
@@ -34,26 +40,42 @@ def bytes_per_param(dtype_str: str) -> int:
         return 2
     if dtype_str in ["float32", "float", "fp32"]:
         return 4
-    if dtype_str in ["fp8", "fp8_e5m2", "fp8_e4m3"]:
+    if dtype_str in ["fp8", "fp8_e5m2", "fp8_e4m3", "f8_e4m3"]:
         return 1
     # fallback guess
     return 2
 
 
 def print_model_size(model_id: str, dtype_str: str):
-    """Load model once with transformers to estimate param count & size."""
+    """Estimate param count & size without blowing up CPU RAM for 11B models."""
+    bpp = bytes_per_param(dtype_str)
+
+    if model_id in KNOWN_NUM_PARAMS:
+        num_params = KNOWN_NUM_PARAMS[model_id]
+        size_bytes = num_params * bpp
+        size_gb = size_bytes / GB
+
+        print(f"[model] Using known param count for {model_id}")
+        print(f"[model] Number of parameters: {num_params:,}")
+        print(f"[model] Assumed dtype: {dtype_str} ({bpp} bytes/param)")
+        print(f"[model] Theoretical weight size: {size_gb:.3f} GB\n")
+        return
+
     if AutoModelForCausalLM is None:
-        print("[info] Skipping model param count (transformers not available).")
+        print("[info] Skipping exact model param count (transformers not available).")
         return
 
     print(f"[model] Loading '{model_id}' with transformers to estimate size...")
     start = time.time()
-    # This loads to CPU by default – fine for 0.6B
-    model = AutoModelForCausalLM.from_pretrained(model_id)
+    # NOTE: trust_remote_code=True is needed for GigaChat/other custom archs
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        trust_remote_code=True,
+        device_map="cpu",
+    )
     load_t = time.time() - start
 
     num_params = sum(p.numel() for p in model.parameters())
-    bpp = bytes_per_param(dtype_str)
     size_bytes = num_params * bpp
     size_gb = size_bytes / GB
 
@@ -121,7 +143,7 @@ def main():
     local_model_path = snapshot_download(repo_id=MODEL_ID)
     print(f"[1/4] Model snapshot ready at: {local_model_path}\n")
 
-    # 2) Model param count + theoretical size
+    # 2) Model param count + theoretical size (using known 11B for GigaChat3)
     print("[2/4] Estimating model parameter count & theoretical size...")
     print_model_size(MODEL_ID, DTYPE_STR)
 
@@ -138,12 +160,19 @@ def main():
     spin_thread.start()
 
     start_time = time.time()
+
+    # Use BOTH A5000s via tensor parallelism
+    # If you want to force single-GPU, change tp_size=1.
     engine = sgl.Engine(
         model_path=local_model_path,
         random_seed=42,
-        dtype=DTYPE_STR,   # force float16 for now
-        # tp_size=1,       # single-GPU; see below for tp_size=2 example
+        dtype=DTYPE_STR,          # "bfloat16"
+        tp_size=2,                # 2 GPUs: split weights across both A5000s
+        mem_fraction_static=0.8,  # can move toward 0.88 later if you want max throughput
+        trust_remote_code=True,   # required for GigaChat's custom MLA/MoE code
+        allow_auto_truncate=True, # safer for long prompts
     )
+
     elapsed = time.time() - start_time
 
     stop_event.set()
@@ -152,15 +181,31 @@ def main():
     print_gpu_memory("[after Engine init]")
 
     # 4) Inference
-    print("[4/4] Running inference...")
-    prompt = "What is the capital of Russia?"
+    print("[4/4] Running inference with GigaChat 3 Lightning...")
+
+    # Use the official chat template for better behavior
+    tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_ID,
+        trust_remote_code=True,
+    )
+
+    user_message = "Какая столица России?"
+    messages = [
+        {"role": "user", "content": user_message},
+    ]
+    chat_prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
     sampling_params = {
         "temperature": 0.7,
-        "max_new_tokens": 64,
+        "max_new_tokens": 128,
     }
 
     t0 = time.time()
-    result = engine.generate(prompt, sampling_params)
+    result = engine.generate(chat_prompt, sampling_params)
     t1 = time.time()
     gen_time = t1 - t0
 
@@ -169,24 +214,33 @@ def main():
     text = result["text"]
 
     # --- token accounting ---
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    prompt_ids = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).input_ids[0]
-    out_ids = tokenizer(text, return_tensors="pt", add_special_tokens=False).input_ids[0]
+    # Count prompt tokens as SGLang sees them (i.e., after chat template)
+    prompt_ids = tokenizer(
+        chat_prompt,
+        return_tensors="pt",
+        add_special_tokens=False,
+    ).input_ids[0]
+
+    out_ids = tokenizer(
+        text,
+        return_tensors="pt",
+        add_special_tokens=False,
+    ).input_ids[0]
 
     num_prompt_tokens = prompt_ids.shape[-1]
     num_output_tokens = out_ids.shape[-1]
 
-    # In many setups text == full completion *without* re-including the prompt.
-    # If it ever includes the prompt, this still works as "total tokens emitted".
-    tokens_per_sec_total = num_output_tokens / gen_time if gen_time > 0 else float("inf")
+    tokens_per_sec = (
+        num_output_tokens / gen_time if gen_time > 0 else float("inf")
+    )
 
-    print("\n=== OUTPUT ===")
+    print("\n=== RAW MODEL OUTPUT ===")
     print(text)
 
-    print(f"\n[stats] Prompt tokens:      {num_prompt_tokens}")
-    print(f"[stats] Output tokens:      {num_output_tokens}")
-    print(f"[stats] Generation time:    {gen_time:.3f} s")
-    print(f"[stats] Tokens/sec (output): {tokens_per_sec_total:.2f}")
+    print(f"\n[stats] Prompt tokens:        {num_prompt_tokens}")
+    print(f"[stats] Output tokens:        {num_output_tokens}")
+    print(f"[stats] Generation time:      {gen_time:.3f} s")
+    print(f"[stats] Tokens/sec (output):  {tokens_per_sec:.2f}")
 
     engine.shutdown()
     print("\nAll done. ✅")
