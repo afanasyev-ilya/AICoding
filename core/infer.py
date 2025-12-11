@@ -2,7 +2,7 @@
 
 import argparse
 from checkpoints import inference_from_saved
-from tests.prompts import MATMUL_PROMPT
+from tests.prompts import *
 
 DEFAULT_PROMPT = "def binary_search(arr, target):\n"
 
@@ -48,7 +48,7 @@ def main():
 
     args = parser.parse_args()
 
-    prompt = args.prompt if args.prompt is not None else DEFAULT_PROMPT
+    prompt = BINARY_SEARCH_PROMPT
     print(f"=== Prompt ===\n{prompt}\n")
 
     output = inference_from_saved(
