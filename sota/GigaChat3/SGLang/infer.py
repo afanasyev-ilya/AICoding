@@ -189,7 +189,7 @@ def main():
         trust_remote_code=True,
     )
 
-    user_message = "Какая столица России?"
+    user_message = "Напиши простейшее матричное умножение на С++ на CUDA."
     messages = [
         {"role": "user", "content": user_message},
     ]
@@ -201,7 +201,7 @@ def main():
 
     sampling_params = {
         "temperature": 0.7,
-        "max_new_tokens": 128,
+        "max_new_tokens": 1000,
     }
 
     t0 = time.time()
