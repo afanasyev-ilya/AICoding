@@ -189,7 +189,7 @@ def main():
         trust_remote_code=True,
     )
 
-    user_message = "Напиши простейшее матричное умножение на С++ на CUDA."
+    user_message = "Напиши простейшее матричное умножение на С++."
     messages = [
         {"role": "user", "content": user_message},
     ]
