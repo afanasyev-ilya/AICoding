@@ -41,7 +41,7 @@ class MoEGPTConfig(BaseGPTConfig):
     num_experts: int = 8
     expert_dim: int = 256
 
-def create_moegpt_deepseek_style(vocab_size: int, **kwargs) -> MoEGPTConfig:
+def create_moegpt_deepseek_large(vocab_size: int, **kwargs) -> MoEGPTConfig:
     """DeepSeek-style alternating MHA -> MoE architecture"""
     return MoEGPTConfig(
         vocab_size=vocab_size,
@@ -52,6 +52,24 @@ def create_moegpt_deepseek_style(vocab_size: int, **kwargs) -> MoEGPTConfig:
         block_size=CONTEXT_SIZE,
         # Each MoE layer gets these settings
         num_experts=16,      # Slightly fewer experts per layer but more layers
+        expert_dim=3072,     
+        dropout=0.1,
+        aux_loss_weight=0.01,
+        pos_encoding="rope",
+        **kwargs
+    )
+
+def create_moegpt_deepseek_tiny(vocab_size: int, **kwargs) -> MoEGPTConfig:
+    """DeepSeek-style alternating MHA -> MoE architecture"""
+    return MoEGPTConfig(
+        vocab_size=vocab_size,
+        # For DeepSeek style, n_layer means number of (MHA + MoE) blocks
+        n_layer=4,           # Total blocks: 20 MHA + 20 MoE layers
+        n_head=16,           
+        n_embd=1024,         
+        block_size=CONTEXT_SIZE,
+        # Each MoE layer gets these settings
+        num_experts=8,      # Slightly fewer experts per layer but more layers
         expert_dim=3072,     
         dropout=0.1,
         aux_loss_weight=0.01,

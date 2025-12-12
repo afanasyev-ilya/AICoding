@@ -14,7 +14,7 @@ from contextlib import nullcontext
 from checkpoints import *
 from tokenizer import BPETokenizer
 
-from model import CONTEXT_SIZE, create_moegpt_deepseek_style, MoEGPTConfig, MoEGPT
+from model import CONTEXT_SIZE, create_moegpt_deepseek_large, create_moegpt_deepseek_tiny, MoEGPTConfig, MoEGPT
 
 ########################################################################################################
 
@@ -510,7 +510,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--max_new_tokens", type=int, default=1000)
     parser.add_argument("--pos_encoding", type=str, choices=["rope", "learned"], default="rope")
-    parser.add_argument("--model_arch", type=str, choices=["deepseek"], default="deepseek")
+    parser.add_argument("--model_arch", type=str, choices=["deepseek_large, deepseek_tiny"], default="deepseek_tiny")
 
     # Dataset settings
     parser.add_argument(
@@ -584,9 +584,12 @@ if __name__ == "__main__":
         print(f"[STATUS] Model loaded from checkpoint: {args.resume_from}")
     else:
         # Create new model
-        if args.model_arch == "deepseek":
-            cfg = create_moegpt_deepseek_style(vocab_size=tok.vocab_size)
-            print("[ARCHITECTURE] Using DeepSeek-style: alternating MHA -> MoE blocks")
+        if args.model_arch == "deepseek_large":
+            cfg = create_moegpt_deepseek_large(vocab_size=tok.vocab_size)
+            print("[ARCHITECTURE] Using DeepSeek-style: alternating MHA -> MoE blocks, LARGE")
+        elif args.model_arch == "deepseek_tiny":
+            cfg = create_moegpt_deepseek_tiny(vocab_size=tok.vocab_size)
+            print("[ARCHITECTURE] Using DeepSeek-style: alternating MHA -> MoE blocks, TINY")
         else:
             print("Incorrect architecture of model provided")
             exit(1)
