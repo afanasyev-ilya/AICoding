@@ -370,7 +370,7 @@ def train(
                     save_time_based_checkpoint(epoch, avg_loss_so_far)
 
             # Periodic logging + best model updates
-            if step % 100 == 0:
+            if step % 10 == 0:
                 avg_loss = total_loss / max(1, num_batches)
 
                 # Row progress: processed X / total_rows rows (per epoch)
