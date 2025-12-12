@@ -37,11 +37,13 @@ class StreamingDataset(IterableDataset):
         tokenizer,
         seq_length=CONTEXT_SIZE,
         text_key: str = "content",
+        debug_data_every: int | None = None
     ):
         self.hf_dataset = hf_dataset
         self.tokenizer = tokenizer
         self.seq_length = seq_length
         self.text_key = text_key
+        self.debug_data_every = debug_data_every
 
         # Stats per epoch
         self.processed_rows = 0   # number of rows scanned
@@ -59,8 +61,6 @@ class StreamingDataset(IterableDataset):
 
             # 1) encode one row
             text = row[self.text_key]
-            if self.processed_rows < 20: 
-                print(text)
 
             tokens = self.tokenizer.encode(text)
 
@@ -76,8 +76,25 @@ class StreamingDataset(IterableDataset):
                 buffer = buffer[self.seq_length:]
 
                 self.chunks_yielded += 1
-                yield torch.tensor(chunk, dtype=torch.long)
 
+                # --- DEBUG PRINT (every N chunks) ---
+                if (
+                    self.debug_data_every is not None
+                    and self.debug_data_every > 0
+                    and self.chunks_yielded % self.debug_data_every == 0
+                ):
+                    # decode chunk back to text for inspection
+                    debug_text = self.tokenizer.decode(chunk)
+                    print("\n" + "=" * 80)
+                    print(
+                        f"[DEBUG] chunk #{self.chunks_yielded} "
+                        f"(processed_rows={self.processed_rows})"
+                    )
+                    print(debug_text)
+                    print("=" * 80 + "\n")
+                # ------------------------------------
+
+                yield torch.tensor(chunk, dtype=torch.long)
         # At end of epoch, we ignore leftover buffer (< seq_length tokens).
 
 
@@ -241,6 +258,7 @@ def train(
     total_rows: Optional[int] = None,
     save_every_minutes: Optional[float] = None,
     text_key: str = "content",
+    debug_data_every: int | None = None
 ):
     """Training with checkpoint saving and resuming.
 
@@ -249,12 +267,12 @@ def train(
     - Removes previous checkpoint file when a new one is saved.
     - Keeps and updates a best-model checkpoint based on running avg loss.
     """
-    
     stream_dataset = StreamingDataset(
         dataset,
         tok,
         seq_length=CONTEXT_SIZE,
         text_key=text_key,
+        debug_data_every=debug_data_every
     )
     # IterableDataset does not support shuffle=True; we also require num_workers=0
     # so that stats (files_yielded) are visible in this process.
@@ -523,6 +541,8 @@ if __name__ == "__main__":
         default="bf16",
         help="Compute precision for weights + activations: fp32, fp16, or bf16",
     )
+    parser.add_argument("--debug_data_every", type=int, default=None,
+                        help="(print debug data after X element of batch)")
     
     # Checkpoint settings
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
@@ -562,7 +582,7 @@ if __name__ == "__main__":
             dataset=tokenizer_dataset,
             vocab_size=args.vocab_size, 
             save_path=args.tok_path,
-            max_samples=args.tok_train_samples,
+            max_samples=args.tok_train_samples
         )
         print(f"Saved tokenizer to {args.tok_path}")
     print("[STATUS] tokenizer prepared.")
@@ -621,6 +641,7 @@ if __name__ == "__main__":
         total_rows=total_rows,
         save_every_minutes=args.save_every_minutes,
         text_key=text_key,
+        debug_data_every=args.debug_data_every
     )
 
     # Save final model
