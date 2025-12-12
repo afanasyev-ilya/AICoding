@@ -21,51 +21,64 @@ from model import CONTEXT_SIZE, create_moegpt_deepseek_style, MoEGPTConfig, MoEG
 from torch.utils.data import IterableDataset  # add this import
 
 
+from torch.utils.data import IterableDataset
+
 class StreamingDataset(IterableDataset):
     """
-    Wrap a (non-streaming) HF dataset and yield fixed-length token chunks.
+    Wrap a HF dataset and yield fixed-length token chunks.
 
-    - Uses the whole underlying dataset once per epoch (unless max_files_per_epoch is set).
-    - Tokenizes on the fly, so memory usage stays reasonable.
-    - Tracks how many source rows/files were processed in this epoch.
+    - Concatenates tokens from multiple rows until we have seq_length.
+    - Handles the case len(tokens) << seq_length by packing many rows together.
+    - Tracks how many source rows were scanned and how many chunks were produced.
     """
     def __init__(
         self,
         hf_dataset,
         tokenizer,
         seq_length=CONTEXT_SIZE,
-        max_files_per_epoch: Optional[int] = None,
         text_key: str = "content",
     ):
         self.hf_dataset = hf_dataset
         self.tokenizer = tokenizer
         self.seq_length = seq_length
-        self.max_files_per_epoch = max_files_per_epoch
         self.text_key = text_key
 
         # Stats per epoch
-        self.files_yielded = 0
+        self.processed_rows = 0   # number of rows scanned
+        self.chunks_yielded = 0  # number of seq_length chunks produced
 
     def __iter__(self):
-        """Each epoch, iterate over the HF dataset and yield chunks."""
-        self.files_yielded = 0
-        num_files = 0
+        """Each epoch, iterate over the HF dataset and yield packed chunks."""
+        self.processed_rows = 0
+        self.chunks_yielded = 0
+
+        buffer: list[int] = []  # token buffer we keep filling as we read rows
 
         for row in self.hf_dataset:
-            if self.max_files_per_epoch is not None and num_files >= self.max_files_per_epoch:
-                break
-            num_files += 1
-            self.files_yielded += 1
+            self.processed_rows += 1
 
-            # Tokenize one file
+            # 1) encode one row
             text = row[self.text_key]
+            if self.processed_rows < 20: 
+                print(text)
+
             tokens = self.tokenizer.encode(text)
 
-            # Chunk into non-overlapping seq_length segments
-            for i in range(0, len(tokens), self.seq_length):
-                chunk = tokens[i:i + self.seq_length]
-                if len(chunk) == self.seq_length:
-                    yield torch.tensor(chunk, dtype=torch.long)
+            if not tokens:
+                continue  # skip completely empty rows
+
+            # 2) append to buffer
+            buffer.extend(tokens)
+
+            # 3) whenever buffer is long enough, cut out chunks
+            while len(buffer) >= self.seq_length:
+                chunk = buffer[:self.seq_length]
+                buffer = buffer[self.seq_length:]
+
+                self.chunks_yielded += 1
+                yield torch.tensor(chunk, dtype=torch.long)
+
+        # At end of epoch, we ignore leftover buffer (< seq_length tokens).
 
 
 class TokenizerStreamingDataset(IterableDataset):
@@ -241,7 +254,6 @@ def train(
         dataset,
         tok,
         seq_length=CONTEXT_SIZE,
-        max_files_per_epoch=None,  # or an int like 100_000 if you want to cap
         text_key=text_key,
     )
     # IterableDataset does not support shuffle=True; we also require num_workers=0
@@ -349,14 +361,15 @@ def train(
                     save_time_based_checkpoint(epoch, avg_loss_so_far)
 
             # Periodic logging + best model updates
-            if step % 10 == 0:
+            if step % 2 == 0:
                 avg_loss = total_loss / max(1, num_batches)
 
                 # Row progress: processed X / total_rows rows (per epoch)
                 if total_rows is not None and total_rows > 0:
-                    rows_seen = getattr(stream_dataset, "files_yielded", 0)
+                    rows_seen = getattr(stream_dataset, "processed_rows", 0)
+                    chunks_created = getattr(stream_dataset, "chunks_yielded", 0)
                     row_pct = rows_seen / total_rows * 100.0
-                    row_info = f" | processed {rows_seen:,}/{total_rows:,} rows this epoch ({row_pct:5.2f}%)"
+                    row_info = f" | processed {rows_seen:,}/{total_rows:,} rows this epoch ({row_pct:5.2f}%) | {chunks_created} chunks"
                 else:
                     row_info = ""
 
