@@ -64,7 +64,7 @@ def create_moegpt_deepseek_tiny(vocab_size: int, **kwargs) -> MoEGPTConfig:
     return MoEGPTConfig(
         vocab_size=vocab_size,
         # For DeepSeek style, n_layer means number of (MHA + MoE) blocks
-        n_layer=4,           # Total blocks: 20 MHA + 20 MoE layers
+        n_layer=6,           # Total blocks: 20 MHA + 20 MoE layers
         n_head=16,           
         n_embd=1024,         
         block_size=CONTEXT_SIZE,
