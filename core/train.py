@@ -241,7 +241,6 @@ def train(
     lr=3e-4,
     grad_accum_steps=2,
     checkpoint_dir="checkpoints",
-    save_every=10,  # kept for compatibility, but not used for epoch-based saving now
     resume_from=None,
     amp_dtype=torch.float16,
     use_autocast=True,
@@ -537,12 +536,10 @@ if __name__ == "__main__":
     
     # Checkpoint settings
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
-    parser.add_argument("--save_every", type=int, default=50,
-                        help="(Unused for epochs now, kept for compatibility)")
     parser.add_argument(
         "--save_every_minutes",
         type=float,
-        default=10.0,
+        default=10,
         help="Save checkpoint every N minutes (time-based). Set <=0 to disable.",
     )
     parser.add_argument("--resume_from", type=str, default=None, 
@@ -620,7 +617,6 @@ if __name__ == "__main__":
         epochs=args.epochs, 
         lr=args.lr,
         checkpoint_dir=args.checkpoint_dir,
-        save_every=args.save_every,
         resume_from=args.resume_from,
         amp_dtype=amp_dtype,
         use_autocast=use_autocast,
