@@ -23,9 +23,9 @@ from torch.utils.data import IterableDataset  # add this import
 
 class StreamingDataset(IterableDataset):
     """
-    Stream the Hugging Face dataset and yield fixed-length token chunks.
+    Wrap a (non-streaming) HF dataset and yield fixed-length token chunks.
 
-    - Uses the *whole* streaming dataset (unless max_files_per_epoch is set).
+    - Uses the whole underlying dataset once per epoch (unless max_files_per_epoch is set).
     - Tokenizes on the fly, so memory usage stays reasonable.
     - Tracks how many source rows/files were processed in this epoch.
     """
@@ -47,7 +47,7 @@ class StreamingDataset(IterableDataset):
         self.files_yielded = 0
 
     def __iter__(self):
-        """Each epoch, iterate over the HF streaming dataset and yield chunks."""
+        """Each epoch, iterate over the HF dataset and yield chunks."""
         self.files_yielded = 0
         num_files = 0
 
@@ -143,70 +143,68 @@ def get_precision_config(precision: str):
         raise ValueError(f"Unsupported precision: {precision}")
 
 
-def load_training_dataset(dataset_name: str, python_large_path: str):
+def load_training_dataset(dataset_name: str):
     """
-    Load the training dataset (streaming + optional map-style) and return:
-      - dataset_stream: HF streaming dataset
-      - dataset_map: map-style dataset or None
+    Load the training dataset (non-streaming, cached on disk) and return:
+      - dataset: HF map-style dataset
       - text_key: column containing code text
+    Hugging Face will automatically download on first use and reuse cache later.
     """
     if dataset_name == "python_large":
-        dataset_stream = load_dataset(python_large_path, split="train", streaming=True)
-        dataset_map = load_dataset(python_large_path, split="train")
+        print("[DATASET] Loading python_large: codeparrot/codeparrot-clean ... (HF will use cache if present)")
+        dataset = load_dataset("codeparrot/codeparrot-clean", split="train")
         text_key = "content"
-        print(f"[DATASET] Using python_large from local path: {python_large_path}")
+        print(f"[DATASET] Loaded python_large: {len(dataset):,} rows.")
     elif dataset_name == "cpp_large":
-        dataset_stream = load_dataset(
+        print("[DATASET] Loading cpp_large: TempestTeam/dataset-the-stack-v2-dedup-sub (C++ subset)...")
+        dataset = load_dataset(
             "TempestTeam/dataset-the-stack-v2-dedup-sub",
             name="C++",
             split="train",
-            streaming=True,
         )
-        dataset_map = None  # too large to load fully
         text_key = "content"
-        print("[DATASET] Using cpp_large: TempestTeam/dataset-the-stack-v2-dedup-sub (C++ subset)")
+        print(f"[DATASET] Loaded cpp_large: {len(dataset):,} rows.")
     elif dataset_name == "cpp_small":
-        # we delibaretly do not stream tiny dataset
-        dataset_stream = load_dataset("shibing624/source_code", "cpp", split="train")
-        dataset_map = load_dataset("shibing624/source_code", "cpp", split="train")
+        print("[DATASET] Loading cpp_small: shibing624/source_code (subset='cpp')...")
+        dataset = load_dataset("shibing624/source_code", "cpp", split="train")
         text_key = "text"
-        print("[DATASET] Using cpp_small: shibing624/source_code (subset='cpp')")
+        print(f"[DATASET] Loaded cpp_small: {len(dataset):,} rows.")
     elif dataset_name == "python_small":
-        dataset_stream = load_dataset("shibing624/source_code", "python", split="train", streaming=True)
-        dataset_map = load_dataset("shibing624/source_code", "python", split="train")
+        print("[DATASET] Loading python_small: shibing624/source_code (subset='python')...")
+        dataset = load_dataset("shibing624/source_code", "python", split="train")
         text_key = "text"
-        print("[DATASET] Using python_small: shibing624/source_code (subset='python')")
+        print(f"[DATASET] Loaded python_small: {len(dataset):,} rows.")
     else:
         raise ValueError(f"Unknown dataset name: {dataset_name}")
     
-    return dataset_stream, dataset_map, text_key
+    return dataset, text_key
 
 
-def build_tokenizer_training_dataset(python_large_path: str) -> TokenizerStreamingDataset:
+def build_tokenizer_training_dataset() -> TokenizerStreamingDataset:
     """
     Build a mixed dataset (Python + C++) to train the tokenizer on.
 
     Uses:
-      - python_large (codeparrot-clean) if available
+      - codeparrot/codeparrot-clean (python_large) via streaming, if available
       - shibing624/source_code (subset='python')
       - shibing624/source_code (subset='cpp')
     """
     datasets_and_keys = []
 
-    if os.path.exists(python_large_path):
-        try:
-            ds_py_large = load_dataset(python_large_path, split="train", streaming=True)
-            datasets_and_keys.append((ds_py_large, "content"))
-            print(f"[TOKENIZER] Added python_large from {python_large_path} for tokenizer training.")
-        except Exception as e:
-            print(f"[TOKENIZER] Failed to load python_large from {python_large_path}: {e}")
-    else:
-        print(f"[TOKENIZER] python_large_path not found ({python_large_path}), skipping it for tokenizer training.")
+    # python_large from HF (streaming) – will use cache if already downloaded
+    try:
+        ds_py_large = load_dataset("codeparrot/codeparrot-clean", split="train", streaming=True)
+        datasets_and_keys.append((ds_py_large, "content"))
+        print("[TOKENIZER] Added python_large (codeparrot/codeparrot-clean) for tokenizer training.")
+    except Exception as e:
+        print(f"[TOKENIZER] Failed to load codeparrot/codeparrot-clean for tokenizer training: {e}")
 
+    # small python
     ds_py_small = load_dataset("shibing624/source_code", "python", split="train", streaming=True)
     datasets_and_keys.append((ds_py_small, "text"))
     print("[TOKENIZER] Added shibing624/source_code (python) for tokenizer training.")
 
+    # small cpp
     ds_cpp_small = load_dataset("shibing624/source_code", "cpp", split="train", streaming=True)
     datasets_and_keys.append((ds_cpp_small, "text"))
     print("[TOKENIZER] Added shibing624/source_code (cpp) for tokenizer training.")
@@ -354,11 +352,11 @@ def train(
             if step % 10 == 0:
                 avg_loss = total_loss / max(1, num_batches)
 
-                # Row progress: processed X / total_rows rows
+                # Row progress: processed X / total_rows rows (per epoch)
                 if total_rows is not None and total_rows > 0:
                     rows_seen = getattr(stream_dataset, "files_yielded", 0)
                     row_pct = rows_seen / total_rows * 100.0
-                    row_info = f" | processed {rows_seen:,}/{total_rows:,} rows ({row_pct:5.2f}%)"
+                    row_info = f" | processed {rows_seen:,}/{total_rows:,} rows this epoch ({row_pct:5.2f}%)"
                 else:
                     row_info = ""
 
@@ -500,14 +498,8 @@ if __name__ == "__main__":
                  "cpp_small", 
                  "cpp_large", 
                  "python_small"],
-        default="python_large",
+        default="cpp_small",
         help="Which dataset to train on",
-    )
-    parser.add_argument(
-        "--python_large_path",
-        type=str,
-        default="/home/i.afanasyev/codeparrot-clean",
-        help="Local path to codeparrot-clean (used for python_large and tokenizer training)",
     )
 
     # Precision settings
@@ -551,7 +543,7 @@ if __name__ == "__main__":
         print(f"[STATUS] Loaded existing tokenizer from {args.tok_path}")
     else:
         print(f"[STATUS] Training byte-level BPE tokenizer (vocab={args.vocab_size}) on mixed Python+C++ datasets...")
-        tokenizer_dataset = build_tokenizer_training_dataset(args.python_large_path)
+        tokenizer_dataset = build_tokenizer_training_dataset()
         tok = BPETokenizer()
         tok.train(
             dataset=tokenizer_dataset,
@@ -564,15 +556,9 @@ if __name__ == "__main__":
 
     # --- Load data for training (selected dataset) ---
     print("[STATUS] preparing dataset...")
-    dataset_stream, dataset_map, text_key = load_training_dataset(args.dataset, args.python_large_path)
-    print("[STATUS] streaming dataset loaded.")
-
-    if dataset_map is not None:
-        total_rows = len(dataset_map)
-        print(f"[STATUS] map-style dataset loaded. total_rows = {total_rows:,}")
-    else:
-        total_rows = None
-        print("[STATUS] no map-style dataset (skipping row count).")
+    dataset_stream, text_key = load_training_dataset(args.dataset)
+    total_rows = len(dataset_stream)
+    print(f"[STATUS] Dataset ready. total_rows = {total_rows:,}")
 
     # Load or create model
     if args.resume_from and args.resume_from != "latest" and os.path.exists(args.resume_from):
@@ -671,3 +657,4 @@ if __name__ == "__main__":
     
     print("\n--- BEST SAMPLE ---")
     print(best_code)
+
