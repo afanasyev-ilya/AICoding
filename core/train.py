@@ -35,11 +35,13 @@ class StreamingDataset(IterableDataset):
         tokenizer,
         seq_length=CONTEXT_SIZE,
         max_files_per_epoch: Optional[int] = None,
+        text_key: str = "content",
     ):
         self.hf_dataset = hf_dataset
         self.tokenizer = tokenizer
         self.seq_length = seq_length
         self.max_files_per_epoch = max_files_per_epoch
+        self.text_key = text_key
 
         # Stats per epoch
         self.files_yielded = 0
@@ -56,13 +58,33 @@ class StreamingDataset(IterableDataset):
             self.files_yielded += 1
 
             # Tokenize one file
-            tokens = self.tokenizer.encode(row["content"])
+            text = row[self.text_key]
+            tokens = self.tokenizer.encode(text)
 
             # Chunk into non-overlapping seq_length segments
             for i in range(0, len(tokens), self.seq_length):
                 chunk = tokens[i:i + self.seq_length]
                 if len(chunk) == self.seq_length:
                     yield torch.tensor(chunk, dtype=torch.long)
+
+
+class TokenizerStreamingDataset(IterableDataset):
+    """
+    Wrapper to train the tokenizer on a mixture of datasets.
+
+    Each yielded example has key 'content', because BPETokenizer.train expects
+    example["content"] to be a string.
+    """
+    def __init__(self, datasets_and_keys):
+        """
+        datasets_and_keys: list of (hf_dataset, text_key) pairs.
+        """
+        self.datasets_and_keys = datasets_and_keys
+
+    def __iter__(self):
+        for hf_ds, text_key in self.datasets_and_keys:
+            for row in hf_ds:
+                yield {"content": row[text_key]}
 
 
 def get_batch_from_dataloader(dataloader):
@@ -130,6 +152,76 @@ def get_precision_config(precision: str):
         raise ValueError(f"Unsupported precision: {precision}")
 
 
+def load_training_dataset(dataset_name: str, python_large_path: str):
+    """
+    Load the training dataset (streaming + optional map-style) and return:
+      - dataset_stream: HF streaming dataset
+      - dataset_map: map-style dataset or None
+      - text_key: column containing code text
+    """
+    if dataset_name == "python_large":
+        dataset_stream = load_dataset(python_large_path, split="train", streaming=True)
+        dataset_map = load_dataset(python_large_path, split="train")
+        text_key = "content"
+        print(f"[DATASET] Using python_large from local path: {python_large_path}")
+    elif dataset_name == "cpp_large":
+        dataset_stream = load_dataset(
+            "TempestTeam/dataset-the-stack-v2-dedup-sub",
+            name="C++",
+            split="train",
+            streaming=True,
+        )
+        dataset_map = None  # too large to load fully
+        text_key = "content"
+        print("[DATASET] Using cpp_large: TempestTeam/dataset-the-stack-v2-dedup-sub (C++ subset)")
+    elif dataset_name == "cpp_small":
+        dataset_stream = load_dataset("shibing624/source_code", "cpp", split="train", streaming=True)
+        dataset_map = load_dataset("shibing624/source_code", "cpp", split="train")
+        text_key = "text"
+        print("[DATASET] Using cpp_small: shibing624/source_code (subset='cpp')")
+    elif dataset_name == "python_small":
+        dataset_stream = load_dataset("shibing624/source_code", "python", split="train", streaming=True)
+        dataset_map = load_dataset("shibing624/source_code", "python", split="train")
+        text_key = "text"
+        print("[DATASET] Using python_small: shibing624/source_code (subset='python')")
+    else:
+        raise ValueError(f"Unknown dataset name: {dataset_name}")
+    
+    return dataset_stream, dataset_map, text_key
+
+
+def build_tokenizer_training_dataset(python_large_path: str) -> TokenizerStreamingDataset:
+    """
+    Build a mixed dataset (Python + C++) to train the tokenizer on.
+
+    Uses:
+      - python_large (codeparrot-clean) if available
+      - shibing624/source_code (subset='python')
+      - shibing624/source_code (subset='cpp')
+    """
+    datasets_and_keys = []
+
+    if os.path.exists(python_large_path):
+        try:
+            ds_py_large = load_dataset(python_large_path, split="train", streaming=True)
+            datasets_and_keys.append((ds_py_large, "content"))
+            print(f"[TOKENIZER] Added python_large from {python_large_path} for tokenizer training.")
+        except Exception as e:
+            print(f"[TOKENIZER] Failed to load python_large from {python_large_path}: {e}")
+    else:
+        print(f"[TOKENIZER] python_large_path not found ({python_large_path}), skipping it for tokenizer training.")
+
+    ds_py_small = load_dataset("shibing624/source_code", "python", split="train", streaming=True)
+    datasets_and_keys.append((ds_py_small, "text"))
+    print("[TOKENIZER] Added shibing624/source_code (python) for tokenizer training.")
+
+    ds_cpp_small = load_dataset("shibing624/source_code", "cpp", split="train", streaming=True)
+    datasets_and_keys.append((ds_cpp_small, "text"))
+    print("[TOKENIZER] Added shibing624/source_code (cpp) for tokenizer training.")
+
+    return TokenizerStreamingDataset(datasets_and_keys)
+
+
 def train(
     model,
     dataset,
@@ -145,6 +237,7 @@ def train(
     use_scaler=True,
     total_rows: Optional[int] = None,
     save_every_minutes: Optional[float] = None,
+    text_key: str = "content",
 ):
     """Training with checkpoint saving and resuming.
 
@@ -159,6 +252,7 @@ def train(
         tok,
         seq_length=CONTEXT_SIZE,
         max_files_per_epoch=None,  # or an int like 100_000 if you want to cap
+        text_key=text_key,
     )
     # IterableDataset does not support shuffle=True; we also require num_workers=0
     # so that stats (files_yielded) are visible in this process.
@@ -217,7 +311,7 @@ def train(
         num_batches = 0
 
         print(f"[STATUS] Starting epoch {epoch}/{epochs}")
-
+        
         for step, batch in enumerate(dataloader):
             global_step += 1
 
@@ -404,7 +498,25 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--max_new_tokens", type=int, default=1000)
     parser.add_argument("--pos_encoding", type=str, choices=["rope", "learned"], default="rope")
-    parser.add_argument("--model_arch", type=str, choices=["deepseek", "optimized"], default="deepseek")
+    parser.add_argument("--model_arch", type=str, choices=["deepseek"], default="deepseek")
+
+    # Dataset settings
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        choices=["python_large", 
+                 "cpp_small", 
+                 "cpp_large", 
+                 "python_small"],
+        default="python_large",
+        help="Which dataset to train on",
+    )
+    parser.add_argument(
+        "--python_large_path",
+        type=str,
+        default="/home/i.afanasyev/codeparrot-clean",
+        help="Local path to codeparrot-clean (used for python_large and tokenizer training)",
+    )
 
     # Precision settings
     parser.add_argument(
@@ -422,7 +534,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--save_every_minutes",
         type=float,
-        default=30.0,
+        default=10.0,
         help="Save checkpoint every N minutes (time-based). Set <=0 to disable.",
     )
     parser.add_argument("--resume_from", type=str, default=None, 
@@ -433,33 +545,42 @@ if __name__ == "__main__":
     # tokenizer settings
     parser.add_argument("--tok_path", type=str, default="./tokenizer.json")
     parser.add_argument("--vocab_size", type=int, default=32000)
+    parser.add_argument(
+        "--tok_train_samples",
+        type=int,
+        default=2000,
+        help="Max samples for tokenizer training across mixed Python+C++ datasets",
+    )
     args = parser.parse_args()
 
-    # Load data
-    DATASET_PATH = "/home/i.afanasyev/codeparrot-clean"
-    print("[STATUS] preparing dataset...")
-
-    # Streaming dataset for training
-    dataset_stream = load_dataset(DATASET_PATH, split="train", streaming=True)
-    print("[STATUS] streaming dataset loaded.")
-
-    # Map-style dataset only for metadata (len, etc.)
-    dataset_map = load_dataset(DATASET_PATH, split="train")
-    total_rows = len(dataset_map)
-    print(f"[STATUS] map-style dataset loaded. total_rows = {total_rows:,}")
-
-    # tokenize data
-    tok = BPETokenizer(tokenizer_path=args.tok_path if os.path.exists(args.tok_path) else None)
-    if tok.tk is None:
-        print(f"[STATUS] Training byte-level BPE tokenizer (vocab={args.vocab_size}) on dataset...")
+    # --- Tokenizer (Python + C++) ---
+    if os.path.exists(args.tok_path):
+        tok = BPETokenizer(tokenizer_path=args.tok_path)
+        print(f"[STATUS] Loaded existing tokenizer from {args.tok_path}")
+    else:
+        print(f"[STATUS] Training byte-level BPE tokenizer (vocab={args.vocab_size}) on mixed Python+C++ datasets...")
+        tokenizer_dataset = build_tokenizer_training_dataset(args.python_large_path)
+        tok = BPETokenizer()
         tok.train(
-            dataset=dataset_stream,
+            dataset=tokenizer_dataset,
             vocab_size=args.vocab_size, 
             save_path=args.tok_path,
-            max_samples=1000
+            max_samples=args.tok_train_samples,
         )
         print(f"Saved tokenizer to {args.tok_path}")
     print("[STATUS] tokenizer prepared.")
+
+    # --- Load data for training (selected dataset) ---
+    print("[STATUS] preparing dataset...")
+    dataset_stream, dataset_map, text_key = load_training_dataset(args.dataset, args.python_large_path)
+    print("[STATUS] streaming dataset loaded.")
+
+    if dataset_map is not None:
+        total_rows = len(dataset_map)
+        print(f"[STATUS] map-style dataset loaded. total_rows = {total_rows:,}")
+    else:
+        total_rows = None
+        print("[STATUS] no map-style dataset (skipping row count).")
 
     # Load or create model
     if args.resume_from and args.resume_from != "latest" and os.path.exists(args.resume_from):
@@ -472,9 +593,8 @@ if __name__ == "__main__":
             cfg = create_moegpt_deepseek_style(vocab_size=tok.vocab_size)
             print("[ARCHITECTURE] Using DeepSeek-style: alternating MHA -> MoE blocks")
         else:
-            cfg = create_moegpt_a5000_optimized(vocab_size=tok.vocab_size)
-            print("[ARCHITECTURE] Using optimized single-MoE architecture")
-        
+            print("Incorrect architecture of model provided")
+            exit(1)
         model = MoEGPT(cfg)
         print("[STATUS] New model created.")
 
@@ -509,6 +629,7 @@ if __name__ == "__main__":
         use_scaler=use_scaler,
         total_rows=total_rows,
         save_every_minutes=args.save_every_minutes,
+        text_key=text_key,
     )
 
     # Save final model
