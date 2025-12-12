@@ -215,19 +215,10 @@ def build_tokenizer_training_dataset() -> TokenizerStreamingDataset:
     Build a mixed dataset (Python + C++) to train the tokenizer on.
 
     Uses:
-      - codeparrot/codeparrot-clean (python_large) via streaming, if available
       - shibing624/source_code (subset='python')
       - shibing624/source_code (subset='cpp')
     """
     datasets_and_keys = []
-
-    # python_large from HF (streaming) – will use cache if already downloaded
-    try:
-        ds_py_large = load_dataset("codeparrot/codeparrot-clean", split="train", streaming=True)
-        datasets_and_keys.append((ds_py_large, "content"))
-        print("[TOKENIZER] Added python_large (codeparrot/codeparrot-clean) for tokenizer training.")
-    except Exception as e:
-        print(f"[TOKENIZER] Failed to load codeparrot/codeparrot-clean for tokenizer training: {e}")
 
     # small python
     ds_py_small = load_dataset("shibing624/source_code", "python", split="train", streaming=True)
@@ -379,7 +370,7 @@ def train(
                     save_time_based_checkpoint(epoch, avg_loss_so_far)
 
             # Periodic logging + best model updates
-            if step % 2 == 0:
+            if step % 100 == 0:
                 avg_loss = total_loss / max(1, num_batches)
 
                 # Row progress: processed X / total_rows rows (per epoch)
@@ -562,12 +553,6 @@ if __name__ == "__main__":
     # tokenizer settings
     parser.add_argument("--tok_path", type=str, default="./tokenizer.json")
     parser.add_argument("--vocab_size", type=int, default=32000)
-    parser.add_argument(
-        "--tok_train_samples",
-        type=int,
-        default=2000,
-        help="Max samples for tokenizer training across mixed Python+C++ datasets",
-    )
     args = parser.parse_args()
 
     # --- Tokenizer (Python + C++) ---
@@ -581,8 +566,7 @@ if __name__ == "__main__":
         tok.train(
             dataset=tokenizer_dataset,
             vocab_size=args.vocab_size, 
-            save_path=args.tok_path,
-            max_samples=args.tok_train_samples
+            save_path=args.tok_path
         )
         print(f"Saved tokenizer to {args.tok_path}")
     print("[STATUS] tokenizer prepared.")
