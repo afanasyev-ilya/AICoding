@@ -87,15 +87,6 @@ class TokenizerStreamingDataset(IterableDataset):
                 yield {"content": row[text_key]}
 
 
-def get_batch_from_dataloader(dataloader):
-    """Get batch from DataLoader instead of random sampling"""
-    for batch in dataloader:
-        x = batch[:, :-1]  # Input sequence
-        y = batch[:, 1:]   # Target sequence (shifted by one)
-        return x, y
-    return None, None
-
-
 def analyze_memory_usage(model, batch_size=16, seq_length=512):
     """Analyze memory usage by layer and provide scaling recommendations"""
     print("=" * 60)
@@ -175,7 +166,8 @@ def load_training_dataset(dataset_name: str, python_large_path: str):
         text_key = "content"
         print("[DATASET] Using cpp_large: TempestTeam/dataset-the-stack-v2-dedup-sub (C++ subset)")
     elif dataset_name == "cpp_small":
-        dataset_stream = load_dataset("shibing624/source_code", "cpp", split="train", streaming=True)
+        # we delibaretly do not stream tiny dataset
+        dataset_stream = load_dataset("shibing624/source_code", "cpp", split="train")
         dataset_map = load_dataset("shibing624/source_code", "cpp", split="train")
         text_key = "text"
         print("[DATASET] Using cpp_small: shibing624/source_code (subset='cpp')")
@@ -311,7 +303,7 @@ def train(
         num_batches = 0
 
         print(f"[STATUS] Starting epoch {epoch}/{epochs}")
-        
+
         for step, batch in enumerate(dataloader):
             global_step += 1
 
@@ -359,7 +351,7 @@ def train(
                     save_time_based_checkpoint(epoch, avg_loss_so_far)
 
             # Periodic logging + best model updates
-            if step % 100 == 0:
+            if step % 10 == 0:
                 avg_loss = total_loss / max(1, num_batches)
 
                 # Row progress: processed X / total_rows rows
@@ -523,7 +515,7 @@ if __name__ == "__main__":
         "--precision",
         type=str,
         choices=["fp32", "fp16", "bf16"],
-        default="fp32",
+        default="bf16",
         help="Compute precision for weights + activations: fp32, fp16, or bf16",
     )
     
