@@ -509,7 +509,12 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--max_new_tokens", type=int, default=1000)
     parser.add_argument("--pos_encoding", type=str, choices=["rope", "learned"], default="rope")
-    parser.add_argument("--model_arch", type=str, choices=["deepseek_large, deepseek_tiny"], default="deepseek_tiny")
+    parser.add_argument(
+    "--model_arch",
+    type=str,
+    choices=["deepseek_large", "deepseek_tiny"],
+    default="deepseek_tiny",
+)
 
     # Dataset settings
     parser.add_argument(
@@ -634,44 +639,4 @@ if __name__ == "__main__":
         save_tokenizer(tok, model_dir)
         print(f"Final model and tokenizer saved to {model_dir}")
 
-    # Generate text with the trained model
-    print("\n" + "="*50)
-    print("GENERATION EXAMPLES")
-    print("="*50)
-    
-    prompts = [
-        "def binary_search(arr, target):\n",
-        "def quicksort(arr):\n",
-        "def fibonacci(n):\n",
-        "class LinkedList:\n    def __init__(self):\n",
-    ]
-    
-    for prompt in prompts:
-        print(f"\n--- Generating for: {prompt.strip()} ---")
-        output = inference(
-            model,
-            tok,
-            prompt,
-            max_new_tokens=args.max_new_tokens,
-            temperature=0.8,
-            amp_dtype=amp_dtype,
-            use_autocast=use_autocast,
-        )
-        print(output)
-        print("-" * 40)
-
-    # Also try multiple samples for the main prompt
-    print("\n--- Multiple samples for binary_search ---")
-    best_code, all_samples = generate_multiple_samples(
-        model,
-        tok, 
-        "def binary_search(arr, target):\n",
-        num_samples=3,
-        max_new_tokens=args.max_new_tokens,
-        amp_dtype=amp_dtype,
-        use_autocast=use_autocast,
-    )
-    
-    print("\n--- BEST SAMPLE ---")
-    print(best_code)
 
