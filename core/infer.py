@@ -48,20 +48,20 @@ def main():
 
     args = parser.parse_args()
 
-    prompt = "You need to implement binary search in python"
-    print(f"=== Prompt ===\n{prompt}\n")
+    for prompt in CPP_PROMPTS:
+        print(f"=== Prompt ===\n{prompt}\n")
 
-    output = inference_from_saved(
-        model_path=args.model_path,
-        tokenizer_path=args.tokenizer_path,
-        prompt=prompt,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        precision=args.precision,
-    )
+        output = inference_from_saved(
+            model_path=args.model_path,
+            tokenizer_path=args.tokenizer_path,
+            prompt=prompt,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            precision=args.precision,
+        )
 
-    print("=== Output ===")
-    print(output)
+        print("=== Output ===")
+        print(output)
 
 
 if __name__ == "__main__":

@@ -37,3 +37,70 @@ def binary_search(arr, target):
         mid_val = arr[mid]       # Get the value at the middle index
 
 """
+
+CPP_PROMPTS = [
+    """
+struct Coord {
+    int x;
+""",
+
+    """
+std::vector<int> data(n, 0);
+for (int i = 0; i
+""",
+
+    """
+int binary_search(const std::vector<int>& a, int target) {
+    int l = 0, r = (int)a.size() - 1;
+    while (l <= r) {
+        int mid = l + (r - l) / 2;
+""",
+
+    """
+int sum_vector(const std::vector<int>& a) {
+    int s = 0;
+    for (int x : a) {
+""",
+
+    """
+class Point {
+public:
+    Point(int x, int y) : x_(x), y_(y) {}
+
+    int getX() const {
+""",
+
+    """
+std::unordered_map<std::string, int> freq;
+for (const auto& s : words) {
+    auto it = freq.find(s);
+    if (it == freq.end()) {
+""",
+
+    """
+std::vector<std::pair<int,int>> items = {/* ... */};
+std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) {
+""",
+
+    """
+template <typename T>
+T my_max(const T& a, const T& b) {
+""",
+
+    """
+int n;
+std::cin >> n;
+std::vector<int> a(n);
+for (int i = 0; i < n; ++i) {
+""",
+
+    """
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    int t;
+    std::cin >> t;
+    while (t--) {
+"""
+]
