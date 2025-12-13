@@ -1,22 +1,33 @@
 # infer.py
-from tokenizer import BPETokenizer
-from model import MoEGPTConfig, MoEGPT
 import argparse
-from tests.prompts import *
-from checkpoints import _get_precision_for_inference, load_model
-import torch
-import torch.nn as nn
 import time
 
+import torch
+import torch.nn as nn  # noqa: F401  (if you don't use it, you can remove)
+from contextlib import nullcontext
 
-def generate(model, 
-             tokenizer,
-             precision,
-             prompt="",
-             max_new_tokens=100,
-             temperature=0.3,
-             measure_speed: bool = True):
-    # Run inference
+from tokenizer import BPETokenizer
+from model import MoEGPTConfig, MoEGPT
+from tests.prompts import CPP_PROMPTS
+from checkpoints import _get_precision_for_inference, load_model
+
+# ---------- ANSI COLORS ----------
+COLOR_PROMPT = "\033[92m"   # bright green
+COLOR_GEN    = "\033[96m"   # cyan
+COLOR_RESET  = "\033[0m"
+# -------------------------------
+
+
+def generate(
+    model,
+    tokenizer,
+    precision,
+    prompt="",
+    max_new_tokens=100,
+    temperature=0.3,
+    measure_speed: bool = True,
+):
+    # Tokenize prompt
     ids = tokenizer.encode(prompt)
     ctx = torch.tensor([ids], dtype=torch.long, device="cuda")
 
@@ -37,10 +48,11 @@ def generate(model,
             )[0].tolist()
     elapsed = time.perf_counter() - start
 
+    total_tokens = len(out)
+    prompt_tokens = len(ids)
+    new_tokens = max(total_tokens - prompt_tokens, 0)
+
     if measure_speed:
-        total_tokens = len(out)
-        prompt_tokens = len(ids)
-        new_tokens = max(total_tokens - prompt_tokens, 0)
         toks_per_sec = 0.0 if elapsed <= 0.0 else new_tokens / elapsed
         print(
             f"[speed] generated {new_tokens} tokens in {elapsed:.3f}s "
@@ -48,8 +60,12 @@ def generate(model,
             f"(prompt={prompt_tokens}, total={total_tokens})"
         )
 
-    generated = tokenizer.decode(out)
-    return generated
+    # Decode full text and only the newly generated part
+    full_text = tokenizer.decode(out)
+    gen_text = tokenizer.decode(out[prompt_tokens:]) if new_tokens > 0 else ""
+
+    return full_text, gen_text
+
 
 def main():
     parser = argparse.ArgumentParser(description="Inference from saved MoEGPT model")
@@ -69,7 +85,7 @@ def main():
         "--prompt",
         type=str,
         default=None,
-        help="Custom prompt string (if not set, uses binary_search prompt)",
+        help="Custom prompt string (if not set, uses CPP_PROMPTS list)",
     )
     parser.add_argument(
         "--max_new_tokens",
@@ -93,34 +109,45 @@ def main():
 
     args = parser.parse_args()
 
-    """
-    Load model and tokenizer for inference.
-
-    precision: "fp32", "fp16", or "bf16"
-      - "fp16": weights -> float16, autocast(float16)
-      - "bf16": weights -> bfloat16, autocast(bfloat16)
-      - "fp32": weights -> float32, no autocast
-    """
-    # Load tokenizer
     print("[STATUS] loading model and preparing tokenizer...")
     tokenizer = BPETokenizer(args.tokenizer_path)
 
-    # Choose precision
+    # Choose precision for weights
     param_dtype, _, _ = _get_precision_for_inference(args.precision)
 
-    # Load model
     model = load_model(MoEGPT, args.model_path)
     model = model.to(device="cuda", dtype=param_dtype)
     model.eval()
     print("[STATUS] model loaded.")
 
-    for prompt in CPP_PROMPTS:
-        print(f"=== Prompt ===\n{prompt}\n")
+    # If user passed a single custom prompt, just run that
+    if args.prompt is not None:
+        prompts = [args.prompt]
+    else:
+        prompts = CPP_PROMPTS
 
-        output = generate(model, tokenizer, args.precision, prompt=prompt, max_new_tokens=args.max_new_tokens, temperature=args.temperature)
+    for idx, prompt in enumerate(prompts):
+        print("\n" + "=" * 80)
+        print(f"[TEST] Prompt #{idx}")
+        print("-" * 80)
 
-        print("=== Output ===")
-        print(output)
+        full_text, gen_text = generate(
+            model,
+            tokenizer,
+            args.precision,
+            prompt=prompt,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            measure_speed=True,
+        )
+
+        # Colored display: prompt in one color, completion in another
+        # We print the *original* prompt string, then only gen_text.
+        print(f"{COLOR_PROMPT}{prompt}{COLOR_GEN}{gen_text}{COLOR_RESET}")
+
+        # If you also want the raw full text for logging/debug, you can print:
+        # print("\n[DEBUG full text]")
+        # print(full_text)
 
 
 if __name__ == "__main__":
