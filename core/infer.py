@@ -1,10 +1,55 @@
 # infer.py
-
+from tokenizer import BPETokenizer
+from model import MoEGPTConfig, MoEGPT
 import argparse
-from checkpoints import inference_from_saved
 from tests.prompts import *
+from checkpoints import _get_precision_for_inference, load_model
+import torch
+import torch.nn as nn
+import time
 
-DEFAULT_PROMPT = "def binary_search(arr, target):\n"
+
+def generate(model, 
+             tokenizer,
+             precision,
+             prompt="",
+             max_new_tokens=100,
+             temperature=0.3,
+             measure_speed: bool = True):
+    # Run inference
+    ids = tokenizer.encode(prompt)
+    ctx = torch.tensor([ids], dtype=torch.long, device="cuda")
+
+    _, amp_dtype, use_autocast = _get_precision_for_inference(precision)
+
+    if use_autocast and amp_dtype != torch.float32:
+        autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype)
+    else:
+        autocast_ctx = nullcontext()
+
+    start = time.perf_counter()
+    with torch.no_grad():
+        with autocast_ctx:
+            out = model.generate(
+                ctx,
+                max_new_tokens,
+                temperature=temperature,
+            )[0].tolist()
+    elapsed = time.perf_counter() - start
+
+    if measure_speed:
+        total_tokens = len(out)
+        prompt_tokens = len(ids)
+        new_tokens = max(total_tokens - prompt_tokens, 0)
+        toks_per_sec = 0.0 if elapsed <= 0.0 else new_tokens / elapsed
+        print(
+            f"[speed] generated {new_tokens} tokens in {elapsed:.3f}s "
+            f"({toks_per_sec:.2f} tok/s) "
+            f"(prompt={prompt_tokens}, total={total_tokens})"
+        )
+
+    generated = tokenizer.decode(out)
+    return generated
 
 def main():
     parser = argparse.ArgumentParser(description="Inference from saved MoEGPT model")
@@ -48,17 +93,31 @@ def main():
 
     args = parser.parse_args()
 
+    """
+    Load model and tokenizer for inference.
+
+    precision: "fp32", "fp16", or "bf16"
+      - "fp16": weights -> float16, autocast(float16)
+      - "bf16": weights -> bfloat16, autocast(bfloat16)
+      - "fp32": weights -> float32, no autocast
+    """
+    # Load tokenizer
+    print("[STATUS] loading model and preparing tokenizer...")
+    tokenizer = BPETokenizer(args.tokenizer_path)
+
+    # Choose precision
+    param_dtype, _, _ = _get_precision_for_inference(args.precision)
+
+    # Load model
+    model = load_model(MoEGPT, args.model_path)
+    model = model.to(device="cuda", dtype=param_dtype)
+    model.eval()
+    print("[STATUS] model loaded.")
+
     for prompt in CPP_PROMPTS:
         print(f"=== Prompt ===\n{prompt}\n")
 
-        output = inference_from_saved(
-            model_path=args.model_path,
-            tokenizer_path=args.tokenizer_path,
-            prompt=prompt,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            precision=args.precision,
-        )
+        output = generate(model, tokenizer, args.precision, prompt=prompt, max_new_tokens=args.max_new_tokens, temperature=args.temperature)
 
         print("=== Output ===")
         print(output)
