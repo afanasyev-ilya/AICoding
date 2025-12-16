@@ -33,13 +33,13 @@ class BaseGPTConfig:
 @dataclass
 class MoEGPTConfig(BaseGPTConfig):
     # MHA settings
-    n_layer: int = 4
-    n_head: int = 8
-    n_embd: int = 256
+    n_layer: int = 6
+    n_head: int = 16
+    n_embd: int = 1024
 
     # MoE settings
     num_experts: int = 8
-    expert_dim: int = 256
+    expert_dim: int = 3072
 
 def create_moegpt_deepseek_tiny(vocab_size: int, **kwargs) -> MoEGPTConfig:
     """DeepSeek-style alternating MHA -> MoE architecture"""

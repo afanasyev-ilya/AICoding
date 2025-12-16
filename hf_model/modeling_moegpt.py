@@ -32,14 +32,22 @@ class MoEGPTForCausalLM(PreTrainedModel):
         )
         self.model = MoEGPT(internal_cfg)
 
-    def forward(self, input_ids=None, labels=None, **kwargs):
-        logits, _, _ = self.model(input_ids)  # your project returns (logits, loss, aux)
+    def forward(self,
+        input_ids=None,
+        attention_mask=None,
+        token_type_ids=None,
+        past_key_values=None,
+        use_cache=None,
+        labels=None,
+        **kwargs):
+        # You can ignore attention_mask/token_type_ids for now
+        logits, _, _ = self.model(input_ids)
 
         loss = None
         if labels is not None:
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
-            loss = F.cross_entropy(
+            loss = torch.nn.functional.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
                 ignore_index=-100,
@@ -47,9 +55,18 @@ class MoEGPTForCausalLM(PreTrainedModel):
 
         return CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=None)
 
-    def prepare_inputs_for_generation(self, input_ids, **kwargs):
-        # For the first smoke test: no KV cache, always feed full sequence
-        return {"input_ids": input_ids}
+
+    def prepare_inputs_for_generation(self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        token_type_ids=None,
+        **kwargs):
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "token_type_ids": token_type_ids,
+        }
 
     @property
     def all_tied_weights_keys(self):

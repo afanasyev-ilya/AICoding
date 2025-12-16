@@ -6,8 +6,15 @@
     "AutoModelForCausalLM": "modeling_moegpt.MoEGPTForCausalLM"
   },
   "vocab_size": 1536,
-  "n_embd": 768,
+  "block_size": 2048,
+  "dropout": 0.1,
+  "aux_loss_weight": 0.01,
+  "pos_encoding": "rope",
+  "rope_base": 10000.0,
+  "rope_scale": 1.0,
   "n_layer": 6,
   "n_head": 16,
-  "block_size": 2048
+  "n_embd": 1024,
+  "num_experts": 8,
+  "expert_dim": 3072
 }

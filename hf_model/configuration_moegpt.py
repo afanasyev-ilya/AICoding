@@ -5,8 +5,8 @@ class MoEGPTConfig(PretrainedConfig):
 
     def __init__(
         self,
-        vocab_size=32000,
-        n_embd=768,
+        vocab_size=1536,
+        n_embd=1024,
         n_layer=6,
         n_head=16,
         block_size=2048,
