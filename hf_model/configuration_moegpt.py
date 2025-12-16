@@ -8,3 +8,22 @@ class MoEGPTConfig(PretrainedConfig):
         # PretrainedConfig will store unknown keys as attributes automatically.
         super().__init__(**kwargs)
 
+        # --- HF/SGLang compatibility aliases ---
+        # hidden_size
+        if not hasattr(self, "hidden_size"):
+            if hasattr(self, "n_embd"):
+                self.hidden_size = self.n_embd
+            elif hasattr(self, "d_model"):
+                self.hidden_size = self.d_model
+
+        # attention heads / layers
+        if not hasattr(self, "num_attention_heads") and hasattr(self, "n_head"):
+            self.num_attention_heads = self.n_head
+
+        if not hasattr(self, "num_hidden_layers") and hasattr(self, "n_layer"):
+            self.num_hidden_layers = self.n_layer
+
+        # max positions
+        if not hasattr(self, "max_position_embeddings") and hasattr(self, "block_size"):
+            self.max_position_embeddings = self.block_size
+

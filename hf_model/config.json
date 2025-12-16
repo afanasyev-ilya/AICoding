@@ -3,6 +3,7 @@
   "architectures": ["MoEGPTForCausalLM"],
   "auto_map": {
     "AutoConfig": "configuration_moegpt.MoEGPTConfig",
+    "AutoModel": "modeling_moegpt.MoEGPTForCausalLM",
     "AutoModelForCausalLM": "modeling_moegpt.MoEGPTForCausalLM"
   },
   "vocab_size": 1536,
