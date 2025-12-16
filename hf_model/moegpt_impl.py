@@ -110,25 +110,56 @@ class MHA(nn.Module):
         k_rotated = (k * cos) + (self._rotate_half(k) * sin)
         return q_rotated, k_rotated
 
-    def forward(self, x):
+    def forward(
+        self,
+        x,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        use_cache: bool = False,
+        **kwargs,
+    ):
+        # NOTE: we accept these args for HF/SGLang compatibility.
+        # We don't implement KV-cache yet (past_key_value/use_cache are ignored).
         B, T, C = x.shape
-        
-        # Fused QKV projection
+
         qkv = self.qkv(x).reshape(B, T, 3, self.n_head, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # (B, nh, T, hd)
 
         if self.use_rope:
             q, k = self._apply_rope(q, k)
 
-        # Use PyTorch's built-in scaled_dot_product_attention (uses Flash Attention when available)
-        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
-            y = F.scaled_dot_product_attention(
-                q, k, v, 
-                attn_mask=None, 
-                dropout_p=self.dropout.p if self.training else 0,
-                is_causal=True
-            )
-        
+        # If an attention_mask is provided, Flash SDPA may not support it depending on torch version.
+        # So: use Flash only when mask is None; otherwise allow math/mem_efficient fallback.
+        if attention_mask is None:
+            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
+                y = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=None,
+                    dropout_p=self.dropout.p if self.training else 0,
+                    is_causal=True,
+                )
+        else:
+            # We accept common HF-style masks: [B, T] with 1 for tokens, 0 for padding.
+            # We'll convert to an additive mask [B,1,1,T] where masked keys get -inf.
+            if attention_mask.dim() == 2:
+                am = attention_mask.to(dtype=torch.bool, device=q.device)  # True = keep
+                # additive mask: 0 for keep, -inf for mask
+                neg_inf = torch.finfo(q.dtype).min
+                attn_mask = (~am).to(dtype=q.dtype) * neg_inf
+                attn_mask = attn_mask[:, None, None, :]  # [B,1,1,T]
+            else:
+                # If it's already a broadcastable mask, just use it as-is.
+                attn_mask = attention_mask
+
+            with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=True):
+                y = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=attn_mask,
+                    dropout_p=self.dropout.p if self.training else 0,
+                    is_causal=True,
+                )
+
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.proj(y)
         y = self.dropout(y)
@@ -146,7 +177,7 @@ class DenseFFN(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(self, x):
+    def forward(self, x, **kwargs):
         return self.net(x)
 
 class Block(nn.Module):
@@ -157,10 +188,10 @@ class Block(nn.Module):
         self.attn = MHA(config)
         self.ff = DenseFFN(config.n_embd, config.dropout)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln1(x))
-        x = x + self.ff(self.ln2(x))
-        return x, x.new_zeros(())  # zero aux
+    def forward(self, x, **kwargs):
+        x = x + self.attn(self.ln1(x), **kwargs)
+        x = x + self.ff(self.ln2(x), **kwargs)
+        return x, x.new_zeros(())
 
 class MoEExpert(nn.Module):
     def __init__(self, config: MoEGPTConfig):
@@ -171,7 +202,7 @@ class MoEExpert(nn.Module):
             nn.Linear(config.expert_dim, config.n_embd),
         )
 
-    def forward(self, x):
+    def forward(self, x, **kwargs):
         return self.expert_fc(x)
 
 class MoELayer(nn.Module):
@@ -183,7 +214,7 @@ class MoELayer(nn.Module):
         self.top_k = 2
         self.noise_epsilon = 1e-2
 
-    def forward(self, x):
+    def forward(self, x, **kwargs):
         B, T, C = x.shape
         x_flat = x.reshape(B * T, C)
         
@@ -210,7 +241,7 @@ class MoELayer(nn.Module):
             mask = expert_mask[:, expert_idx] > 0
             if mask.any():
                 expert_input = x_flat[mask]
-                expert_output = expert(expert_input)
+                expert_output = expert(expert_input, **kwargs)
                 
                 # Apply weights - VECTORIZED
                 weights = expert_mask[mask, expert_idx].unsqueeze(-1)
@@ -244,11 +275,9 @@ class MHAThenMoEBlock(nn.Module):
         self.attn = MHA(config)
         self.moe = MoELayer(config)  # Replace dense FFN with MoE
 
-    def forward(self, x):
-        # MHA part
-        x = x + self.attn(self.ln1(x))
-        # MoE part (replaces FFN)
-        moe_out, aux_loss = self.moe(self.ln2(x))
+    def forward(self, x, **kwargs):
+        x = x + self.attn(self.ln1(x), **kwargs)
+        moe_out, aux_loss = self.moe(self.ln2(x), **kwargs)
         x = x + moe_out
         return x, aux_loss
 
@@ -271,9 +300,26 @@ class MoEGPT(nn.Module):
         self.ln_f = nn.LayerNorm(config.n_embd)
         self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, idx, targets=None):
+    def forward(
+        self,
+        idx=None,
+        targets=None,
+        input_ids=None,
+        labels=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        use_cache: bool = False,
+        **kwargs,
+    ):
+        # Alias HF names -> your internal names
+        if idx is None and input_ids is not None:
+            idx = input_ids
+        if targets is None and labels is not None:
+            targets = labels
+
         B, T = idx.shape
-        
+
         x = self.tok_emb(idx)
         if self.pos_emb is not None:
             pos = torch.arange(0, T, device=idx.device).unsqueeze(0)
@@ -282,33 +328,37 @@ class MoEGPT(nn.Module):
         x = self.drop(x)
         aux_total = x.new_zeros(())
 
-        # --- Activation checkpointing over blocks ---
         if self.training:
             for block in self.blocks:
-                # Need default arg block=block to avoid late binding in closure
                 def custom_forward(x_in, block=block):
-                    return block(x_in)  # returns (x_out, aux_loss)
+                    # NOTE: checkpoint can't accept kwargs directly; but in training
+                    # you typically don't have attention_mask etc anyway.
+                    return block(x_in)
 
                 x, aux_loss = checkpoint(custom_forward, x)
                 aux_total = aux_total + aux_loss
         else:
-            # No checkpointing during eval/inference
             for block in self.blocks:
-                x, aux_loss = block(x)
+                x, aux_loss = block(
+                    x,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=None,      # ignored
+                    use_cache=False,          # ignored
+                    **kwargs,
+                )
                 aux_total = aux_total + aux_loss
-        # --------------------------------------------
 
         x = self.ln_f(x)
         logits = self.head(x)
-        
+
         loss = None
         if targets is not None:
-            # Compute CE in fp32 for stability
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)).float(),
                 targets.view(-1)
             )
-        
+
         return logits, loss, aux_total
 
     @torch.no_grad()

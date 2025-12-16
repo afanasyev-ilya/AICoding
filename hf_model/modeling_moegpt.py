@@ -35,6 +35,7 @@ class MoEGPTForCausalLM(PreTrainedModel):
 
     # we don't tie any weights, keep it empty.
     _tied_weights_keys = []
+    _supports_attention_backend = True
 
     def __init__(self, config: MoEGPTConfig):
         super().__init__(config)
@@ -66,7 +67,6 @@ class MoEGPTForCausalLM(PreTrainedModel):
 
         return CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=None)
 
-
     def prepare_inputs_for_generation(self,
         input_ids,
         past_key_values=None,
@@ -84,3 +84,17 @@ class MoEGPTForCausalLM(PreTrainedModel):
         # Newer loader code expects a dict-like object with .keys()
         keys = getattr(self, "_tied_weights_keys", None) or []
         return OrderedDict((k, True) for k in keys)
+
+    def get_input_embeddings(self):
+        # Adjust attribute names if yours differ.
+        return self.model.tok_emb
+
+    def set_input_embeddings(self, value):
+        self.model.tok_emb = value
+
+    # Strongly recommended for CausalLMs (some tooling calls these too)
+    def get_output_embeddings(self):
+        return self.lm_head  # or self.head if that's your name
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings  # or self.head = new_embeddings

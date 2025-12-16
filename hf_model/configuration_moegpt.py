@@ -27,3 +27,14 @@ class MoEGPTConfig(PretrainedConfig):
         if not hasattr(self, "max_position_embeddings") and hasattr(self, "block_size"):
             self.max_position_embeddings = self.block_size
 
+        # ---- NEW: KV heads (MHA/GQA/MQA) ----
+        # For your current attention (same number of Q/K/V heads), this should match num_attention_heads.
+        if not hasattr(self, "num_key_value_heads"):
+            if hasattr(self, "num_attention_heads"):
+                self.num_key_value_heads = int(self.num_attention_heads)
+            elif hasattr(self, "n_head"):
+                self.num_key_value_heads = int(self.n_head)
+            else:
+                # last-resort safe default
+                self.num_key_value_heads = 1
+
