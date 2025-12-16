@@ -1,0 +1,13 @@
+{
+  "model_type": "moegpt",
+  "architectures": ["MoEGPTForCausalLM"],
+  "auto_map": {
+    "AutoConfig": "configuration_moegpt.MoEGPTConfig",
+    "AutoModelForCausalLM": "modeling_moegpt.MoEGPTForCausalLM"
+  },
+  "vocab_size": 1536,
+  "n_embd": 768,
+  "n_layer": 6,
+  "n_head": 16,
+  "block_size": 2048
+}

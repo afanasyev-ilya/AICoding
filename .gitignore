@@ -1,3 +1,4 @@
 core/checkpoints/*
 core/__pycache__/*
 core/saved_models/*
+hf_model/model.safetensors
