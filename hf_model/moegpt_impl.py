@@ -41,27 +41,6 @@ class MoEGPTConfig(BaseGPTConfig):
     num_experts: int = 8
     expert_dim: int = 3072
 
-def create_moegpt_deepseek_tiny(vocab_size: int, **kwargs) -> MoEGPTConfig:
-    """DeepSeek-style alternating MHA -> MoE architecture"""
-    return MoEGPTConfig(
-        vocab_size=vocab_size,
-        # For DeepSeek style, n_layer means number of (MHA + MoE) blocks
-        n_layer=6,           # Total blocks: 20 MHA + 20 MoE layers
-        n_head=16,           
-        n_embd=1024,         
-        block_size=CONTEXT_SIZE,
-        # Each MoE layer gets these settings
-        num_experts=8,      # Slightly fewer experts per layer but more layers
-        expert_dim=3072,     
-        dropout=0.1,
-        aux_loss_weight=0.01,
-        pos_encoding="rope",
-        **kwargs
-    )
-
-########################################################################################################
-
-
 # ---- RoPE helper ----
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim: int, base: float = 10000.0, scale: float = 1.0, max_seq_len: int = 4096):

@@ -3,6 +3,8 @@ import torch
 import torch.nn.functional as F
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers import PreTrainedModel, PretrainedConfig
+from dataclasses import fields, is_dataclass
 from .configuration_moegpt import MoEGPTConfig
 from collections import OrderedDict
 
@@ -11,6 +13,21 @@ _THIS_DIR = os.path.dirname(__file__)
 sys.path.insert(0, _THIS_DIR)
 from .moegpt_impl import MoEGPT, MoEGPTConfig as InternalConfig
 
+def _build_internal_config(cfg: PretrainedConfig) -> InternalConfig:
+    """
+    Convert HF config -> your internal dataclass config.
+    No hardcoded dimensions here: everything comes from config.json.
+    """
+    d = cfg.to_dict()
+
+    # Filter out HF bookkeeping keys and keep only what your dataclass accepts
+    if is_dataclass(InternalConfig):
+        allowed = {f.name for f in fields(InternalConfig)}
+        kwargs = {k: v for k, v in d.items() if k in allowed}
+        return InternalConfig(**kwargs)
+
+    # If your InternalConfig is not a dataclass
+    return InternalConfig(**d)
 
 class MoEGPTForCausalLM(PreTrainedModel):
     config_class = MoEGPTConfig
@@ -23,13 +40,7 @@ class MoEGPTForCausalLM(PreTrainedModel):
         super().__init__(config)
 
         # Build your internal config. Map fields as needed.
-        internal_cfg = InternalConfig(
-            vocab_size=config.vocab_size,
-            n_embd=config.n_embd,
-            n_layer=config.n_layer,
-            n_head=config.n_head,
-            block_size=config.block_size,
-        )
+        internal_cfg = _build_internal_config(config)
         self.model = MoEGPT(internal_cfg)
 
     def forward(self,
