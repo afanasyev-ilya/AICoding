@@ -96,7 +96,7 @@ def main():
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.3,
+        default=0.5,
         help="Sampling temperature",
     )
     parser.add_argument(

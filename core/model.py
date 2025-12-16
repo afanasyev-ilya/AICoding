@@ -351,13 +351,35 @@ class MoEGPT(nn.Module):
         return logits, loss, aux_total
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens: int, temperature=0.8):
-        # No internal autocast; caller controls precision context
+    def generate(self, idx, max_new_tokens: int, temperature=0.6, top_p=0.85, top_k=0, repetition_penalty=1.15):
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -self.config.block_size:]
             logits, _, _ = self.forward(idx_cond)
-            logits = logits[:, -1, :] / temperature
-            probs = F.softmax(logits, dim=-1)
+
+            logits = logits[:, -1, :] / max(temperature, 1e-6)
+
+            # --- repetition penalty (simple, effective) ---
+            if repetition_penalty is not None and repetition_penalty > 1.0:
+                for b in range(idx.size(0)):
+                    prev = idx[b].tolist()
+                    # penalize tokens already generated
+                    logits[b, prev] /= repetition_penalty
+
+            # --- top-p / nucleus ---
+            if top_p and top_p < 1.0:
+                sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+                probs = torch.softmax(sorted_logits, dim=-1)
+                cum = torch.cumsum(probs, dim=-1)
+
+                mask = cum > top_p
+                mask[..., 0] = False  # keep at least 1 token
+                sorted_logits[mask] = -float("inf")
+                logits = torch.zeros_like(logits).scatter(1, sorted_idx, sorted_logits)
+
+            probs = torch.softmax(logits, dim=-1)
             next_id = torch.multinomial(probs, num_samples=1)
             idx = torch.cat([idx, next_id], dim=1)
+
         return idx
+
+
