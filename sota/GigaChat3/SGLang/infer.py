@@ -4,6 +4,8 @@ import sys
 import time
 import threading
 import os
+import torch
+import torch.nn as nn
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 # Recommended in the GigaChat docs for tooling that may run custom code
@@ -161,14 +163,11 @@ def main():
 
     start_time = time.time()
 
-    # Use BOTH A5000s via tensor parallelism
-    # If you want to force single-GPU, change tp_size=1.
     engine = sgl.Engine(
         model_path=local_model_path,
         random_seed=42,
-        dtype=DTYPE_STR,          # "bfloat16"
-        tp_size=2,                # 2 GPUs: split weights across both A5000s
-        mem_fraction_static=0.8,  # can move toward 0.88 later if you want max throughput
+        dtype="auto",
+        mem_fraction_static=0.88,
         trust_remote_code=True,   # required for GigaChat's custom MLA/MoE code
         allow_auto_truncate=True, # safer for long prompts
     )
@@ -205,7 +204,9 @@ def main():
     }
 
     t0 = time.time()
+    torch.cuda.nvtx.range_push("giga")
     result = engine.generate(chat_prompt, sampling_params)
+    torch.cuda.nvtx.range_pop()
     t1 = time.time()
     gen_time = t1 - t0
 
